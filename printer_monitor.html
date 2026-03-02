@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>🖨️ Printer Monitor</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0a0a0f; color: #e2e8f0; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; min-height: 100vh; padding: 20px; }
+    .container { max-width: 560px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+
+    /* Header */
+    .header { display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 1px solid #1e293b; padding-bottom: 12px; }
+    .header-title { font-size: 15px; font-weight: 700; color: #f8fafc; }
+    .header-sub { font-size: 11px; color: #475569; margin-top: 2px; }
+    .header-meta { text-align: right; font-size: 11px; color: #475569; line-height: 1.8; }
+    .header-meta span { color: #94a3b8; }
+
+    /* Alert banners */
+    .alert { border-radius: 6px; padding: 10px 14px; font-size: 12px; font-weight: 600; border-left: 3px solid; }
+    .alert-critical { background: #1a0a0a; border-color: #ef4444; color: #fca5a5; }
+    .alert-warning  { background: #1a150a; border-color: #f59e0b; color: #fcd34d; }
+    .alert-success  { background: #0a1a0f; border-color: #22c55e; color: #86efac; }
+    .alert-ok       { background: #0a1a0f; border-color: #22c55e; color: #86efac; font-weight: 500; }
+
+    /* Status card */
+    .card { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+    .card-top { display: flex; align-items: center; justify-content: space-between; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; color: #fff; }
+    .badge-printing  { background: #16a34a; }
+    .badge-paused    { background: #d97706; }
+    .badge-error     { background: #dc2626; }
+    .badge-complete  { background: #2563eb; }
+    .badge-cancelled { background: #475569; }
+    .badge-standby   { background: #334155; }
+    .badge-unknown   { background: #334155; }
+    .spinner { font-size: 11px; color: #475569; animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+    .filename { font-size: 11px; color: #64748b; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .progress-row { display: flex; justify-content: space-between; font-size: 12px; margin-top: 4px; }
+    .progress-pct { color: #4ade80; font-weight: 700; }
+    .progress-layer { color: #64748b; }
+    .progress-bar-bg { background: #1e293b; border-radius: 99px; height: 8px; margin-top: 6px; overflow: hidden; }
+    .progress-bar-fill { height: 100%; border-radius: 99px; background: #22c55e; transition: width 0.6s ease; }
+
+    .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .stat-label { color: #475569; font-size: 11px; }
+    .stat-value { color: #f1f5f9; font-size: 13px; margin-top: 1px; }
+
+    .temps { border-top: 1px solid #1e293b; padding-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+    .temp-row { display: flex; align-items: center; gap: 10px; }
+    .temp-label { color: #475569; width: 52px; font-size: 11px; }
+    .temp-val { font-weight: 700; font-size: 13px; }
+    .temp-ok   { color: #4ade80; }
+    .temp-bad  { color: #f87171; }
+    .temp-target { color: #475569; font-size: 11px; }
+
+    /* Button */
+    .btn { width: 100%; background: #1e293b; border: 1px solid #334155; color: #94a3b8; font-family: inherit; font-size: 12px; padding: 9px; border-radius: 6px; cursor: pointer; transition: background 0.15s; }
+    .btn:hover:not(:disabled) { background: #263347; }
+    .btn:disabled { opacity: 0.4; cursor: default; }
+
+    /* Config panel */
+    .config { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+    .config h3 { font-size: 11px; color: #475569; text-transform: uppercase; letter-spacing: 0.05em; }
+    .config-row { display: flex; gap: 8px; align-items: center; }
+    .config-row label { color: #64748b; font-size: 11px; white-space: nowrap; min-width: 90px; }
+    .config-row input { flex: 1; background: #0a0a0f; border: 1px solid #334155; color: #e2e8f0; font-family: inherit; font-size: 12px; padding: 5px 8px; border-radius: 4px; }
+    .config-row input:focus { outline: none; border-color: #3b82f6; }
+    .config-row select { flex: 1; background: #0a0a0f; border: 1px solid #334155; color: #e2e8f0; font-family: inherit; font-size: 12px; padding: 5px 8px; border-radius: 4px; }
+
+    /* Log */
+    .log { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 14px; }
+    .log h3 { font-size: 11px; color: #475569; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
+    .log-list { max-height: 180px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+    .log-entry { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+    .log-time  { color: #334155; width: 44px; flex-shrink: 0; }
+    .log-pct   { color: #64748b; width: 38px; }
+    .log-layer { color: #334155; }
+    .log-alert { color: #f87171; font-weight: 600; margin-left: auto; }
+    .log-ok    { color: #22c55e; margin-left: auto; }
+
+    .footer { text-align: center; font-size: 10px; color: #1e293b; padding-top: 4px; }
+
+    /* Notification dot */
+    .notif-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #ef4444; animation: blink 1s infinite; margin-left: 6px; }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+  </style>
+</head>
+<body>
+<div class="container">
+
+  <!-- Header -->
+  <div class="header">
+    <div>
+      <div class="header-title">🖨️ Printer Monitor</div>
+      <div class="header-sub" id="printerUrl">—</div>
+    </div>
+    <div class="header-meta">
+      Checks: <span id="checkCount">0</span><br>
+      Last: <span id="lastCheck">—</span><br>
+      Next: <span id="countdown">—</span>
+    </div>
+  </div>
+
+  <!-- Config -->
+  <div class="config" id="configPanel">
+    <h3>⚙️ Configuration</h3>
+    <div class="config-row">
+      <label>Printer URL</label>
+      <input type="text" id="cfgHost" value="http://10.0.107.158" placeholder="http://192.168.1.100" />
+    </div>
+    <div class="config-row">
+      <label>Interval</label>
+      <select id="cfgInterval">
+        <option value="300000">5 minutes</option>
+        <option value="600000">10 minutes</option>
+        <option value="900000">15 minutes</option>
+        <option value="1800000" selected>30 minutes</option>
+        <option value="3600000">60 minutes</option>
+      </select>
+    </div>
+    <button class="btn" onclick="applyConfig()">▶ Start Monitoring</button>
+  </div>
+
+  <!-- Alerts -->
+  <div id="alertsContainer"></div>
+
+  <!-- Status card (hidden until first fetch) -->
+  <div class="card" id="statusCard" style="display:none">
+    <div class="card-top">
+      <span class="badge" id="stateBadge">—</span>
+      <span class="spinner" id="spinner" style="display:none">refreshing…</span>
+    </div>
+    <div>
+      <div class="filename" id="filename">—</div>
+      <div class="progress-row">
+        <span class="progress-pct" id="progressPct">0%</span>
+        <span class="progress-layer" id="layerInfo">—</span>
+      </div>
+      <div class="progress-bar-bg"><div class="progress-bar-fill" id="progressFill" style="width:0%"></div></div>
+    </div>
+    <div class="stats-grid">
+      <div><div class="stat-label">Elapsed</div><div class="stat-value" id="elapsed">—</div></div>
+      <div><div class="stat-label">ETA</div><div class="stat-value" id="eta">—</div></div>
+      <div><div class="stat-label">Filament</div><div class="stat-value" id="filament">—</div></div>
+      <div><div class="stat-label">Z Position</div><div class="stat-value" id="zpos">—</div></div>
+    </div>
+    <div class="temps">
+      <div class="temp-row">
+        <span class="temp-label">Hotend</span>
+        <span class="temp-val temp-ok" id="hotendTemp">—</span>
+        <span class="temp-target" id="hotendTarget">/ —</span>
+        <span id="hotendIcon">✅</span>
+      </div>
+      <div class="temp-row">
+        <span class="temp-label">Bed</span>
+        <span class="temp-val temp-ok" id="bedTemp">—</span>
+        <span class="temp-target" id="bedTarget">/ —</span>
+        <span id="bedIcon">✅</span>
+      </div>
+    </div>
+  </div>
+
+  <button class="btn" id="refreshBtn" onclick="checkNow()" style="display:none">🔄 Check Now</button>
+
+  <!-- Log -->
+  <div class="log" id="logPanel" style="display:none">
+    <h3>Check History</h3>
+    <div class="log-list" id="logList"></div>
+  </div>
+
+  <div class="footer">Monitors: thermal anomaly · Klippy state · clog · stall · Z shift · print state</div>
+</div>
+
+<script>
+  let PRINTER_HOST = "http://10.0.107.158";
+  let INTERVAL_MS  = 30 * 60 * 1000;
+  let timerID      = null;
+  let nextCheckAt  = null;
+  let countdownID  = null;
+  let checkCount   = 0;
+
+  function fmtTime(s) {
+    if (s < 0) return "—";
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+    return `${h}h ${m}m ${sec}s`;
+  }
+  function fmtNow() {
+    return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+
+  function detectAnomalies(s) {
+    const alerts = [];
+    const ps  = s.print_stats    || {};
+    const ext = s.extruder       || {};
+    const bed = s.heater_bed     || {};
+    const vsd = s.virtual_sdcard || {};
+    const wh  = s.webhooks       || {};
+    const th  = s.toolhead       || {};
+
+    if (wh.state && wh.state !== "ready")
+      alerts.push({ level: "critical", msg: `🔴 Klippy not ready: ${wh.state} — ${wh.state_message || ""}` });
+
+    if (bed.target > 0 && Math.abs(bed.temperature - bed.target) > 15)
+      alerts.push({ level: "critical", msg: `🌡️ Thermal anomaly: Bed target ${bed.target}°C but actual ${bed.temperature?.toFixed(1)}°C` });
+
+    if (ext.target > 0 && Math.abs(ext.temperature - ext.target) > 20)
+      alerts.push({ level: "critical", msg: `🌡️ Thermal anomaly: Hotend target ${ext.target}°C but actual ${ext.temperature?.toFixed(1)}°C` });
+
+    const state = ps.state || "";
+    const elapsed = ps.print_duration || 0;
+    const filUsed = ps.filament_used  || 0;
+    const progress = vsd.progress || 0;
+    const pos = th.position || [0,0,0,0];
+
+    if (state === "printing" && elapsed > 300 && filUsed < 5)
+      alerts.push({ level: "warning", msg: "🧵 Possible clog / under-extrusion: very low filament after 5+ min" });
+    if (state === "printing" && elapsed > 600 && progress < 0.001)
+      alerts.push({ level: "warning", msg: "⏸️ Possible stall: no progress after 10 min" });
+    if (state === "printing" && elapsed > 120 && pos[2] < 0.1)
+      alerts.push({ level: "warning", msg: `📐 Z anomaly: Z=${pos[2]?.toFixed(3)}mm while printing` });
+    if (state === "error")
+      alerts.push({ level: "critical", msg: `🛑 Print entered ERROR state: ${ps.message || "unknown"}` });
+    if (state === "cancelled")
+      alerts.push({ level: "warning", msg: "🛑 Print was cancelled" });
+    if (state === "complete")
+      alerts.push({ level: "success", msg: `🎉 Print complete! ${ps.filename}` });
+
+    return alerts;
+  }
+
+  function applyConfig() {
+    PRINTER_HOST = document.getElementById("cfgHost").value.replace(/\/+$/, "");
+    INTERVAL_MS  = parseInt(document.getElementById("cfgInterval").value);
+    document.getElementById("printerUrl").textContent = PRINTER_HOST;
+    document.getElementById("configPanel").style.display = "none";
+    document.getElementById("statusCard").style.display  = "flex";
+    document.getElementById("refreshBtn").style.display  = "block";
+    document.getElementById("logPanel").style.display    = "block";
+    checkNow();
+  }
+
+  async function fetchStatus() {
+    document.getElementById("spinner").style.display = "inline";
+    document.getElementById("refreshBtn").disabled = true;
+    try {
+      const resp = await fetch(
+        `${PRINTER_HOST}/printer/objects/query?print_stats&extruder&heater_bed&toolhead&virtual_sdcard&webhooks&display_status`,
+        { cache: "no-store" }
+      );
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      const s = data.result?.status || {};
+      renderStatus(s);
+      const found = detectAnomalies(s);
+      renderAlerts(found);
+      addLog(s, found);
+
+      // Browser notification for critical alerts
+      found.filter(a => a.level === "critical" || a.level === "warning").forEach(a => {
+        if (Notification.permission === "granted") {
+          new Notification("🖨️ Printer Alert", { body: a.msg, icon: "" });
+        }
+      });
+
+      checkCount++;
+      document.getElementById("checkCount").textContent = checkCount;
+      document.getElementById("lastCheck").textContent  = fmtNow();
+    } catch (e) {
+      renderAlerts([{ level: "critical", msg: `❌ Cannot reach printer: ${e.message}` }]);
+    } finally {
+      document.getElementById("spinner").style.display = "none";
+      document.getElementById("refreshBtn").disabled = false;
+    }
+  }
+
+  function renderStatus(s) {
+    const ps  = s.print_stats    || {};
+    const ext = s.extruder       || {};
+    const bed = s.heater_bed     || {};
+    const vsd = s.virtual_sdcard || {};
+    const th  = s.toolhead       || {};
+    const pos = th.position || [0,0,0,0];
+
+    const state    = ps.state || "unknown";
+    const progress = (vsd.progress || 0) * 100;
+    const elapsed  = ps.print_duration || 0;
+    const total    = ps.total_duration  || 0;
+    const eta      = total > elapsed ? total - elapsed : -1;
+    const layer    = ps.info?.current_layer ?? "?";
+    const totLayer = ps.info?.total_layer   ?? "?";
+    const fil      = ((ps.filament_used || 0) / 1000).toFixed(2);
+
+    const badgeEl = document.getElementById("stateBadge");
+    badgeEl.className = `badge badge-${state}`;
+    badgeEl.textContent = state.toUpperCase();
+
+    document.getElementById("filename").textContent    = ps.filename || "—";
+    document.getElementById("progressPct").textContent = `${progress.toFixed(1)}%`;
+    document.getElementById("layerInfo").textContent   = `Layer ${layer}/${totLayer}`;
+    document.getElementById("progressFill").style.width = `${Math.min(progress, 100)}%`;
+    document.getElementById("elapsed").textContent     = fmtTime(elapsed);
+    document.getElementById("eta").textContent         = fmtTime(eta);
+    document.getElementById("filament").textContent    = `${fil}m`;
+    document.getElementById("zpos").textContent        = `${pos[2]?.toFixed(2)}mm`;
+
+    const hotendOk = ext.target === 0 || Math.abs(ext.temperature - ext.target) <= 20;
+    const bedOk    = bed.target === 0  || Math.abs(bed.temperature  - bed.target)  <= 15;
+
+    document.getElementById("hotendTemp").textContent   = `${ext.temperature?.toFixed(1)}°C`;
+    document.getElementById("hotendTemp").className     = `temp-val ${hotendOk ? "temp-ok" : "temp-bad"}`;
+    document.getElementById("hotendTarget").textContent = `/ ${ext.target}°C`;
+    document.getElementById("hotendIcon").textContent   = hotendOk ? "✅" : "⚠️";
+
+    document.getElementById("bedTemp").textContent      = `${bed.temperature?.toFixed(1)}°C`;
+    document.getElementById("bedTemp").className        = `temp-val ${bedOk ? "temp-ok" : "temp-bad"}`;
+    document.getElementById("bedTarget").textContent    = `/ ${bed.target}°C`;
+    document.getElementById("bedIcon").textContent      = bedOk ? "✅" : "⚠️";
+  }
+
+  function renderAlerts(alerts) {
+    const c = document.getElementById("alertsContainer");
+    c.innerHTML = "";
+    if (!alerts.length) {
+      c.innerHTML = `<div class="alert alert-ok">✅ All systems nominal — no anomalies detected</div>`;
+      return;
+    }
+    alerts.forEach(a => {
+      const div = document.createElement("div");
+      div.className = `alert alert-${a.level}`;
+      div.textContent = a.msg;
+      c.appendChild(div);
+    });
+    // Flash tab title
+    if (alerts.some(a => a.level === "critical")) {
+      document.title = "🚨 PRINTER ALERT — Monitor";
+      setTimeout(() => { document.title = "🖨️ Printer Monitor"; }, 5000);
+    }
+  }
+
+  function addLog(s, alerts) {
+    const ps  = s.print_stats    || {};
+    const vsd = s.virtual_sdcard || {};
+    const state    = ps.state || "unknown";
+    const progress = ((vsd.progress || 0) * 100).toFixed(1);
+    const layer    = ps.info?.current_layer ?? "?";
+    const totLayer = ps.info?.total_layer   ?? "?";
+    const list = document.getElementById("logList");
+    const div  = document.createElement("div");
+    div.className = "log-entry";
+    const alertHtml = alerts.length
+      ? `<span class="log-alert">⚠️ ${alerts.length} alert${alerts.length > 1 ? "s" : ""}</span>`
+      : `<span class="log-ok">✅</span>`;
+    div.innerHTML = `
+      <span class="log-time">${fmtNow()}</span>
+      <span class="badge badge-${state}" style="font-size:10px;padding:1px 5px">${state.toUpperCase()}</span>
+      <span class="log-pct">${progress}%</span>
+      <span class="log-layer">L${layer}/${totLayer}</span>
+      ${alertHtml}
+    `;
+    list.prepend(div);
+    // Keep max 48 entries
+    while (list.children.length > 48) list.removeChild(list.lastChild);
+  }
+
+  function checkNow() {
+    if (timerID) clearTimeout(timerID);
+    if (countdownID) clearInterval(countdownID);
+    fetchStatus().then(scheduleNext);
+  }
+
+  function scheduleNext() {
+    if (timerID) clearTimeout(timerID);
+    nextCheckAt = Date.now() + INTERVAL_MS;
+    timerID = setTimeout(checkNow, INTERVAL_MS);
+    // Countdown ticker
+    if (countdownID) clearInterval(countdownID);
+    countdownID = setInterval(() => {
+      const diff = nextCheckAt - Date.now();
+      if (diff <= 0) { document.getElementById("countdown").textContent = "checking…"; return; }
+      const m = Math.floor(diff / 60000), s = Math.floor((diff % 60000) / 1000);
+      document.getElementById("countdown").textContent = `${m}m ${s}s`;
+    }, 1000);
+  }
+
+  // Request browser notification permission
+  if ("Notification" in window && Notification.permission === "default") {
+    Notification.requestPermission();
+  }
+</script>
+</body>
+</html>
