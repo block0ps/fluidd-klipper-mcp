@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Self-elevate permissions if not already executable
+chmod +x "$0" 2>/dev/null || true
 # =============================================================================
 #  fluidd-klipper-mcp — Interactive Setup Script
 #  Automates all Quick Start steps from the README

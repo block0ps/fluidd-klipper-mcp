@@ -78,6 +78,28 @@ real-time control and visibility over 3D printers running **Klipper firmware** v
 
 ## Quick Start
 
+### ⚡ Automated Setup (Recommended)
+
+Run the interactive setup script — it handles all steps below, asks for confirmation before making changes, and works on macOS, Linux, and Windows (Git Bash).
+
+```bash
+git clone https://github.com/block0ps/fluidd-klipper-mcp.git
+cd fluidd-klipper-mcp
+chmod +x setup.sh
+./setup.sh
+```
+
+Or via one-liner (no clone needed):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/block0ps/fluidd-klipper-mcp/main/setup.sh | bash
+```
+
+---
+
+### Manual Setup
+
+
 ### 1. Clone & Build
 
 ```bash
