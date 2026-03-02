@@ -26,42 +26,48 @@ ask()     { echo -e "${BOLD}${CYAN}  ➜  $1${RESET}"; }
 
 # Prompt with a default value. Usage: prompt_default VAR "Question" "default"
 prompt_default() {
-  local -n _ref=$1
-  local question=$2
-  local default=$3
-  ask "${question}"
-  echo -en "     ${DIM}[default: ${default}]${RESET} : "
-  read -r _ref
-  if [[ -z "${_ref}" ]]; then
-    _ref="${default}"
+  local _var=$1
+  local _question=$2
+  local _default=$3
+  local _input
+  ask "${_question}"
+  echo -en "     ${DIM}[default: ${_default}]${RESET} : "
+  read -r _input
+  if [[ -z "${_input}" ]]; then
+    _input="${_default}"
   fi
+  eval "${_var}=\"\${_input}\""
 }
 
 # Prompt required (no default). Usage: prompt_required VAR "Question"
 prompt_required() {
-  local -n _ref=$1
-  local question=$2
+  local _var=$1
+  local _question=$2
+  local _input
   while true; do
-    ask "${question}"
+    ask "${_question}"
     echo -n "     : "
-    read -r _ref
-    if [[ -n "${_ref}" ]]; then break; fi
+    read -r _input
+    if [[ -n "${_input}" ]]; then break; fi
     warn "This field is required."
   done
+  eval "${_var}=\"\${_input}\""
 }
 
 # Prompt secret (masked input)
 prompt_secret() {
-  local -n _ref=$1
-  local question=$2
-  local default=$3
-  ask "${question}"
-  echo -en "     ${DIM}[leave blank to skip / default: ${default}]${RESET} : "
-  read -rs _ref
+  local _var=$1
+  local _question=$2
+  local _default=$3
+  local _input
+  ask "${_question}"
+  echo -en "     ${DIM}[leave blank to skip / default: ${_default}]${RESET} : "
+  read -rs _input
   echo
-  if [[ -z "${_ref}" ]]; then
-    _ref="${default}"
+  if [[ -z "${_input}" ]]; then
+    _input="${_default}"
   fi
+  eval "${_var}=\"\${_input}\""
 }
 
 # Ask for yes/no confirmation before proceeding
