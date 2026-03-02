@@ -1,0 +1,72 @@
+version: 2
+name: custom
+displayName: Custom MCP Servers
+registry:
+  fluidd-klipper:
+    description: "Fluidd/Klipper 3D Printer Management — real-time monitoring, job control, cost calculation, and failure detection"
+    title: "Fluidd Klipper 3D Printer"
+    type: server
+    dateAdded: "2025-02-27T00:00:00Z"
+    image: fluidd-klipper-mcp-server:latest
+    ref: ""
+    readme: ""
+    toolsUrl: ""
+    source: ""
+    upstream: ""
+    icon: ""
+    tools:
+      - name: get_printer_status
+      - name: get_temperatures
+      - name: get_print_job_status
+      - name: get_klippy_status
+      - name: get_moonraker_status
+      - name: get_active_alerts
+      - name: check_failure_detection
+      - name: get_printer_logs
+      - name: get_camera_snapshot_url
+      - name: start_print
+      - name: pause_print
+      - name: resume_print
+      - name: cancel_print
+      - name: emergency_stop
+      - name: get_print_queue
+      - name: add_to_queue
+      - name: remove_from_queue
+      - name: list_print_files
+      - name: get_print_history
+      - name: calculate_print_cost
+      - name: set_temperature
+      - name: send_gcode
+      - name: restart_klippy
+      - name: restart_firmware
+      - name: list_available_tools
+    secrets:
+      - name: PRINTER_HOST
+        env: PRINTER_HOST
+        example: "http://192.168.1.100"
+      - name: PRINTER_API_TOKEN
+        env: PRINTER_API_TOKEN
+        example: "your-moonraker-api-key"
+      - name: FILAMENT_COST_PER_KG
+        env: FILAMENT_COST_PER_KG
+        example: "25.0"
+      - name: POWER_COST_PER_KWH
+        env: POWER_COST_PER_KWH
+        example: "0.12"
+      - name: PRINTER_WATTS
+        env: PRINTER_WATTS
+        example: "150.0"
+      - name: MARKUP_PERCENTAGE
+        env: MARKUP_PERCENTAGE
+        example: "30.0"
+    metadata:
+      category: monitoring
+      tags:
+        - 3d-printing
+        - klipper
+        - fluidd
+        - moonraker
+        - automation
+        - manufacturing
+      license: MIT
+      owner: local
