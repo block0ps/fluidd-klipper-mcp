@@ -108,6 +108,11 @@ claude_config_path() {
   esac
 }
 
+
+# ── Global defaults (may be overridden interactively) ─────────────────
+INSTALL_DIR="${HOME}/fluidd-klipper-mcp"
+PRINTER_HOST=""
+
 # ── Preflight checks ──────────────────────────────────────────────────────────
 check_prereqs() {
   header "Step 0 — Checking Prerequisites"
@@ -149,8 +154,7 @@ check_prereqs() {
 step_clone_and_build() {
   header "Step 1 — Clone Repository & Build Docker Image"
 
-  local default_dir="${HOME}/fluidd-klipper-mcp"
-  prompt_default INSTALL_DIR "Where should the repo be cloned?" "${default_dir}"
+  prompt_default INSTALL_DIR "Where should the repo be cloned?" "${INSTALL_DIR}"
 
   # Check if directory already exists
   if [[ -d "${INSTALL_DIR}" ]]; then
