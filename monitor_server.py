@@ -341,7 +341,7 @@ def build_system_prompt() -> str:
         prog  = vsd.get("progress", 0) * 100
         el    = ps.get("print_duration", 0)
         tot   = ps.get("total_duration", 0)
-        eta   = max(tot - el, 0)
+        eta   = max((el / (prog/100)) - el, 0) if prog > 0.5 else 0
         def _t(sec):
             h = int(sec)//3600; m = (int(sec)%3600)//60
             return f"{h}h {m}m"
@@ -782,7 +782,10 @@ def process_chat_agentic(user_message: str):
     # Has tool calls
     expanded = expand_tool_calls(tool_calls)
     is_multi = len(expanded) > 1
-    if is_trust_active():
+    _tier_map = {t["name"]: t["tier"] for t in TOOL_REGISTRY}
+    max_tier  = max((_tier_map.get(a["tool"], 1) for a in expanded), default=1)
+    # Tier 1 (read-only) always executes directly — no confirmation ever needed
+    if max_tier == 1 or is_trust_active():
         final, exec_log = _execute_pending({
             "expanded": expanded, "tool_calls": tool_calls, "asst_raw": asst_raw,
             "msg_payload": msg_payload, "system": system})
@@ -796,11 +799,13 @@ def process_chat_agentic(user_message: str):
             "user_message": user_message, "msg_payload": msg_payload,
             "asst_raw": asst_raw, "tool_calls": tool_calls, "expanded": expanded,
             "system": system, "is_multi": is_multi,
+            "max_tier": max_tier,
             "created_at": datetime.now().isoformat()}
     return {
         "type": "pending_action",
         "action_id": aid,
         "is_multi": is_multi,
+        "max_tier": max_tier,
         "actions": [{"tool": a["tool"], "printer_id": a["printer_id"],
                      "printer_name": a["printer_name"], "description": a["description"]}
                     for a in expanded]}
@@ -1865,7 +1870,7 @@ function fleetCard(p){
   var s=p.status||{},ps=s.print_stats||{},ext=s.extruder||{},bed=s.heater_bed||{},
       vsd=s.virtual_sdcard||{};
   var state=ps.state||'unknown',prog=(vsd.progress||0)*100,
-      el=ps.print_duration||0,tot=ps.total_duration||0,eta=tot>el?tot-el:-1;
+      el=ps.print_duration||0,eta=(prog>0.5&&el>0)?(el/(prog/100))-el:-1;
   var alerts=p.active_alerts||[];
   var hasCrit=alerts.some(function(a){return a.level==='critical';});
   var hasWarn=!hasCrit&&alerts.some(function(a){return a.level==='warning';});
@@ -1980,7 +1985,7 @@ function renderDetailStatus(s,name){
   var ps=s.print_stats||{},ext=s.extruder||{},bed=s.heater_bed||{},
       vsd=s.virtual_sdcard||{},th=s.toolhead||{},pos=th.position||[0,0,0,0];
   var state=ps.state||'unknown',prog=(vsd.progress||0)*100,
-      el=ps.print_duration||0,tot=ps.total_duration||0,eta=tot>el?tot-el:-1,
+      el=ps.print_duration||0,eta=(prog>0.5&&el>0)?(el/(prog/100))-el:-1,
       layer=(ps.info&&ps.info.current_layer)||'?',totL=(ps.info&&ps.info.total_layer)||'?',
       fil=((ps.filament_used||0)/1000).toFixed(2);
   document.getElementById('stateBadge').className='badge badge-'+state;
@@ -2256,6 +2261,17 @@ function chatKeydown(e){
 var agentStatus={tier:2,trust_active:false,tier3_active:false};
 var pendingCountdowns={};  // action_id -> intervalID
 
+// C, X, Z or Esc abort any active post-confirm countdown
+document.addEventListener('keydown',function(e){
+  var active=Object.keys(pendingCountdowns);
+  if(!active.length)return;
+  var k=e.key;
+  if(k==='Escape'||k==='c'||k==='C'||k==='x'||k==='X'||k==='z'||k==='Z'){
+    e.preventDefault();
+    active.forEach(function(aid){abortMultiAction(aid,false);});
+  }
+});
+
 function refreshAgentStatus(){
   fetch('/api/agent/status').then(function(r){return r.json();}).then(function(d){
     agentStatus=d;
@@ -2272,12 +2288,6 @@ async function sendChat(){
   var inp=document.getElementById('chatInput');
   var msg=inp.value.trim();
   if(!msg)return;
-  // If there's an active multi-printer countdown, typing = abort
-  var activeCD=Object.keys(pendingCountdowns);
-  if(activeCD.length>0){
-    activeCD.forEach(function(aid){abortMultiAction(aid,true);});
-    return;
-  }
   inp.value='';inp.style.height='auto';
   var now=new Date().toISOString();
   chatHistory.push({role:'user',content:msg,time:now});
@@ -2320,101 +2330,107 @@ async function sendChat(){
 
 function renderPendingAction(d){
   var box=document.getElementById('chatMessages');
-  var isTier3=d.actions&&d.actions.some(function(a){
+  var isTier3=(d.max_tier||2)>=3||(d.actions&&d.actions.some(function(a){
     return['cancel_print','delete_file','emergency_stop'].includes(a.tool);
-  });
+  }));
   var card=document.createElement('div');
   card.className='action-card'+(isTier3?' tier3':'');
   card.id='action-card-'+d.action_id;
 
+  // Title
   var title=document.createElement('div');
   title.className='action-card-title';
   title.textContent=d.is_multi
-    ?'\ud83e\udd16 Fleet action — '+d.actions.length+' printers'
+    ?'\ud83e\udd16 Fleet action \u2014 '+d.actions.length+' printers'
     :'\ud83e\udd16 Action requested';
   card.appendChild(title);
 
-  var list=document.createElement('div');
-  list.className='action-list';
+  // Action list
+  var list=document.createElement('div');list.className='action-list';
   (d.actions||[]).forEach(function(a){
-    var it=document.createElement('div');
-    it.className='action-item';
-    it.textContent=a.description;
-    list.appendChild(it);
+    var it=document.createElement('div');it.className='action-item';
+    it.textContent=a.description;list.appendChild(it);
   });
   card.appendChild(list);
 
-  if(d.is_multi){
-    // 30-second countdown with abort
-    var cdBar=document.createElement('div');cdBar.className='countdown-bar';
-    var fill=document.createElement('div');fill.className='countdown-bar-fill';
-    fill.id='cd-fill-'+d.action_id;fill.style.width='100%';
-    cdBar.appendChild(fill);card.appendChild(cdBar);
-    var cdTxt=document.createElement('div');cdTxt.className='countdown-txt';
-    cdTxt.id='cd-txt-'+d.action_id;
-    cdTxt.textContent='Executing in 30s — type anything or click Abort to cancel';
-    card.appendChild(cdTxt);
-    var btns=document.createElement('div');btns.className='action-btns';
-    var abortBtn=document.createElement('button');
-    abortBtn.className='btn-abort';abortBtn.textContent='Abort';
-    abortBtn.onclick=function(){abortMultiAction(d.action_id,false);};
-    btns.appendChild(abortBtn);
-    card.appendChild(btns);
-    box.appendChild(card);box.scrollTop=box.scrollHeight;
-    // Start countdown
-    var secs=30,total=30;
-    var iv=setInterval(function(){
-      secs--;
-      var pct=(secs/total)*100;
-      var f=document.getElementById('cd-fill-'+d.action_id);
-      var t=document.getElementById('cd-txt-'+d.action_id);
-      if(f)f.style.width=pct+'%';
-      if(t)t.textContent='Executing in '+secs+'s — type anything or click Abort to cancel';
-      if(f)f.style.background=secs<=10?'#ef4444':'#3b82f6';
-      if(secs<=0){
-        clearInterval(iv);
-        delete pendingCountdowns[d.action_id];
-        executeConfirmedAction(d.action_id,false,0,card);
-      }
-    },1000);
-    pendingCountdowns[d.action_id]=iv;
-  } else {
-    // Normal: Confirm / Deny + optional trust checkbox
-    var btns=document.createElement('div');btns.className='action-btns';
-    var conf=document.createElement('button');
-    conf.className='btn-confirm';conf.textContent='Confirm';
-    conf.onclick=function(){
-      var th=parseInt(document.getElementById('trust-hrs-'+d.action_id).value)||0;
-      var useTrust=document.getElementById('trust-cb-'+d.action_id).checked;
-      executeConfirmedAction(d.action_id,true,useTrust?th:0,card);
-    };
-    var deny=document.createElement('button');
-    deny.className='btn-deny';deny.textContent='Deny';
-    deny.onclick=function(){executeConfirmedAction(d.action_id,false,0,card);};
-    btns.appendChild(conf);btns.appendChild(deny);
+  // Confirm / Deny always shown first (trust row beneath)
+  var btns=document.createElement('div');btns.className='action-btns';
 
-    // Trust row
-    var trustRow=document.createElement('div');trustRow.className='trust-row';
-    var tcb=document.createElement('input');
-    tcb.type='checkbox';tcb.id='trust-cb-'+d.action_id;tcb.style.accentColor='#3b82f6';
-    var tsel=document.createElement('select');
-    tsel.id='trust-hrs-'+d.action_id;
-    [1,4,8,24,48,72,168].forEach(function(h){
-      var o=document.createElement('option');
-      o.value=h;o.textContent=h<24?h+'h':Math.round(h/24)+'d';
-      if(h===(agentStatus.trust_duration_hours||24))o.selected=true;
-      tsel.appendChild(o);
-    });
-    var tlbl=document.createElement('label');
-    tlbl.htmlFor='trust-cb-'+d.action_id;
-    tlbl.textContent='Trust LLM actions for';
-    trustRow.appendChild(tcb);trustRow.appendChild(tlbl);
-    trustRow.appendChild(tsel);
-    btns.appendChild(trustRow);
-    card.appendChild(btns);
-    box.appendChild(card);box.scrollTop=box.scrollHeight;
-  }
+  var conf=document.createElement('button');
+  conf.className='btn-confirm';conf.textContent='Confirm';
+  conf.onclick=function(){
+    var useTrust=!!(document.getElementById('trust-cb-'+d.action_id)&&
+                    document.getElementById('trust-cb-'+d.action_id).checked);
+    var th=useTrust?(parseInt((document.getElementById('trust-hrs-'+d.action_id)||{}).value)||0):0;
+    btns.remove(); // remove confirm/deny row
+    if(d.is_multi){
+      startPostConfirmCountdown(d.action_id,th,card,box);
+    }else{
+      executeConfirmedAction(d.action_id,true,th,card);
+    }
+  };
+
+  var deny=document.createElement('button');
+  deny.className='btn-deny';deny.textContent='Deny';
+  deny.onclick=function(){executeConfirmedAction(d.action_id,false,0,card);};
+  btns.appendChild(conf);btns.appendChild(deny);
+
+  // Trust row
+  var trustRow=document.createElement('div');trustRow.className='trust-row';
+  var tcb=document.createElement('input');
+  tcb.type='checkbox';tcb.id='trust-cb-'+d.action_id;tcb.style.accentColor='#3b82f6';
+  var tsel=document.createElement('select');tsel.id='trust-hrs-'+d.action_id;
+  [1,4,8,24,48,72,168].forEach(function(h){
+    var o=document.createElement('option');
+    o.value=h;o.textContent=h<24?h+'h':Math.round(h/24)+'d';
+    if(h===(agentStatus.trust_duration_hours||24))o.selected=true;
+    tsel.appendChild(o);
+  });
+  var tlbl=document.createElement('label');
+  tlbl.htmlFor='trust-cb-'+d.action_id;tlbl.textContent='Trust LLM for';
+  trustRow.appendChild(tcb);trustRow.appendChild(tlbl);trustRow.appendChild(tsel);
+  btns.appendChild(trustRow);
+  card.appendChild(btns);
+
+  box.appendChild(card);box.scrollTop=box.scrollHeight;
   document.getElementById('chatSend').disabled=false;
+}
+
+/* Post-confirm 30-second countdown for multi-printer actions.
+   Only starts AFTER the user has clicked Confirm. */
+function startPostConfirmCountdown(action_id,trust_hours,card,box){
+  var cdBar=document.createElement('div');cdBar.className='countdown-bar';
+  var fill=document.createElement('div');fill.className='countdown-bar-fill';
+  fill.id='cd-fill-'+action_id;fill.style.width='100%';
+  cdBar.appendChild(fill);card.appendChild(cdBar);
+
+  var cdTxt=document.createElement('div');cdTxt.className='countdown-txt';
+  cdTxt.id='cd-txt-'+action_id;
+  cdTxt.innerHTML='Executing in <b>30s</b> \u2014 press C\u2009/\u2009X\u2009/\u2009Z\u2009/\u2009Esc or click Abort to cancel';
+  card.appendChild(cdTxt);
+
+  var abortRow=document.createElement('div');abortRow.className='action-btns';
+  var abortBtn=document.createElement('button');
+  abortBtn.className='btn-abort';abortBtn.textContent='Abort';
+  abortBtn.onclick=function(){abortMultiAction(action_id,false);};
+  abortRow.appendChild(abortBtn);card.appendChild(abortRow);
+  if(box)box.scrollTop=box.scrollHeight;
+
+  var secs=30,total=30;
+  var iv=setInterval(function(){
+    secs--;
+    var pct=(secs/total)*100;
+    var f=document.getElementById('cd-fill-'+action_id);
+    var t=document.getElementById('cd-txt-'+action_id);
+    if(f){f.style.width=pct+'%';f.style.background=secs<=10?'#ef4444':'#3b82f6';}
+    if(t)t.innerHTML='Executing in <b>'+secs+'s</b> \u2014 press C\u2009/\u2009X\u2009/\u2009Z\u2009/\u2009Esc or click Abort to cancel';
+    if(secs<=0){
+      clearInterval(iv);
+      delete pendingCountdowns[action_id];
+      executeConfirmedAction(action_id,true,trust_hours,card); // confirmed=true
+    }
+  },1000);
+  pendingCountdowns[action_id]=iv;
 }
 
 function abortMultiAction(action_id, silent){
