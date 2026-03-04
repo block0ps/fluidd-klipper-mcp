@@ -383,10 +383,10 @@ def build_system_prompt() -> str:
     active_tools = get_active_tools()
     lines.append(f"  Available tools: {chr(10).join('    ' + t['name'] + ' — ' + t['description'][:60] for t in active_tools)}")
     lines.append("")
-    lines.append("Printer IDs for tool calls:")
+    lines.append("IMPORTANT — Use these exact printer_id values in all tool calls:")
     for p_ in config.get("printers", []):
         if p_.get("enabled", True):
-            lines.append(f"  {p_['id']} = {p_.get('name', p_['id'])}")
+            lines.append(f"  printer_id=\"{p_['id']}\"  →  {p_.get('name', p_['id'])}")
     lines.append("")
     lines.append("Be concise and technically precise. Reference specific values when relevant.\n"
     "IMPORTANT: When you need data, ALWAYS use the provided tools via structured "
@@ -615,7 +615,10 @@ def _tool_no_printer(tool_name, args) -> str:
 
 def execute_tool(tool_name: str, args: dict, printer_id: str) -> str:
     pr = get_printer_by_id(printer_id)
-    if not pr: return f"Error: printer '{printer_id}' not found."
+    if not pr:
+        msg = f"Error: printer '{printer_id}' not found. Known IDs: {[p['id'] for p in config.get('printers',[])]}"
+        print(f"  [{datetime.now().strftime('%H:%M:%S')}] [Agent] {msg}")
+        return msg
     nm = pr.get("name", printer_id)
     try:
         if tool_name == "get_printer_status":
@@ -953,10 +956,37 @@ def save_config():
         json.dump(config, f, indent=2)
 
 def get_printer_by_id(pid):
-    for p in config.get("printers", []):
+    """Look up a printer by id, display name, or close match.
+    The LLM often passes the display name ('QiDi Plus 4 w AMS') as the
+    printer_id argument, so we need to handle both."""
+    if not pid:
+        return None
+    printers = config.get("printers", [])
+    # 1. Exact id match
+    for p in printers:
         if p["id"] == pid:
             return p
+    # 2. Exact display name match (case-insensitive)
+    pid_lower = pid.strip().lower()
+    for p in printers:
+        if p.get("name", "").strip().lower() == pid_lower:
+            return p
+    # 3. Sanitised name match (spaces/hyphens → underscores)
+    def _sanitise(s):
+        s = s.lower()
+        for ch in " -./()[]{}": s = s.replace(ch, "_")
+        while "__" in s: s = s.replace("__", "_")
+        return s.strip("_")
+    pid_san = _sanitise(pid)
+    for p in printers:
+        if _sanitise(p.get("name", "")) == pid_san or _sanitise(p["id"]) == pid_san:
+            return p
+    # 4. Substring match (model may truncate the name)
+    for p in printers:
+        if pid_lower in p.get("name", "").lower() or pid_lower in p["id"].lower():
+            return p
     return None
+
 
 # ── Anomaly detection ──────────────────────────────────────────────────────────
 
