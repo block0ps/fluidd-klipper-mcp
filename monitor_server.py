@@ -17,7 +17,7 @@ Usage:
 Config: monitor_config.json (auto-created on first run, auto-migrates old format)
 """
 
-import sys, os, json, time, smtplib, threading, subprocess, uuid
+import sys, os, json, re, time, smtplib, threading, subprocess, uuid
 import urllib.request, urllib.error, urllib.parse
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -388,7 +388,9 @@ def build_system_prompt() -> str:
         if p_.get("enabled", True):
             lines.append(f"  {p_['id']} = {p_.get('name', p_['id'])}")
     lines.append("")
-    lines.append("Be concise and technically precise. Reference specific values when relevant.")
+    lines.append("Be concise and technically precise. Reference specific values when relevant.\n"
+    "IMPORTANT: When you need data, ALWAYS use the provided tools via structured "
+    "tool_calls — never output <function> tags or describe what you would do.")
     lines.append("When taking actions, use tool calls rather than describing what you would do.")
     lines.append("For multi-printer operations use printer_id='all' where supported.")
     return "\n".join(lines)
@@ -434,9 +436,9 @@ TOOL_REGISTRY = [
          "limit": {"type": "integer", "description": "Max files to return (default 20)"}},
          "required": ["printer_id"]}},
     {"name": "get_alert_log", "tier": 1,
-     "description": "Get the recent monitor alert log.",
+     "description": "Get the recent fleet-wide alert dispatch log (covers ALL printers). No printer_id argument exists — this returns alerts for all printers.",
      "parameters": {"type": "object", "properties": {
-         "limit": {"type": "integer", "description": "Number of recent alerts (default 20)"}},
+         "limit": {"type": "integer", "description": "Number of recent alerts to return (default 20, max 100)"}},
          "required": []}},
     # ── Tier 2: reversible actions ────────────────────────────────────────────
     {"name": "pause_print", "tier": 2,
@@ -761,6 +763,47 @@ def _execute_pending(pending: dict):
         pending["msg_payload"], pending["asst_raw"], tc_results, pending["system"])
     return final, exec_log
 
+
+def _parse_text_tool_calls(text: str):
+    """Fallback parser for models (Groq/Llama, etc.) that emit tool calls as
+    <function>name{"arg": val}</function> text instead of structured tool_calls.
+    Returns (cleaned_text, calls_list) in the same format as adapter.chat()."""
+    # Match <function>toolname{...}</function>  (args may span multiple lines)
+    pattern = re.compile(r'<function>(\w+)(\{[^<]*?\})?</function>', re.DOTALL)
+    calls = []
+    for i, m in enumerate(pattern.finditer(text)):
+        name     = m.group(1)
+        args_str = (m.group(2) or '{}').strip()
+        # Normalise: sometimes the model writes the arg value without quotes
+        try:
+            args = json.loads(args_str)
+        except Exception:
+            args = {}
+        fake_id = f"txt_{i}_{name}"
+        calls.append({
+            "id":   fake_id,
+            "name": name,
+            "args": args,
+            # Synthetic raw that matches the OpenAI tool_calls format so that
+            # chat_with_results() can feed results back properly
+            "raw":  {"id": fake_id, "type": "function",
+                     "function": {"name": name,
+                                  "arguments": json.dumps(args)}}
+        })
+    cleaned = pattern.sub('', text).strip()
+    return cleaned, calls
+
+
+def _make_oai_asst_raw(tool_calls: list, text: str | None) -> dict:
+    """Build a synthetic OpenAI-style assistant raw block for text-parsed calls."""
+    return {
+        "content": text or None,
+        "tool_calls": [{"id": tc["id"], "type": "function",
+                        "function": {"name": tc["name"],
+                                     "arguments": json.dumps(tc["args"])}}
+                       for tc in tool_calls]
+    }
+
 def process_chat_agentic(user_message: str):
     """Agentic chat entry point. Returns a result dict the HTTP handler serialises."""
     llm_cfg = config.get("llm", {})
@@ -774,6 +817,18 @@ def process_chat_agentic(user_message: str):
     msg_payload.append({"role": "user", "content": user_message})
     # First LLM call
     text, tool_calls, asst_raw = adapter.chat(msg_payload, system, tools)
+    # Fallback: some models (Groq/Llama) emit <function>name{...}</function>
+    # as text instead of structured tool_calls. Detect and route them.
+    if not tool_calls and text and '<function>' in text:
+        cleaned, tool_calls = _parse_text_tool_calls(text)
+        if tool_calls:
+            text    = cleaned or None
+            # Build a synthetic asst_raw so chat_with_results works correctly
+            prov = config.get("llm", {}).get("provider", "anthropic")
+            if prov in ("openai", "ollama"):
+                asst_raw = _make_oai_asst_raw(tool_calls, text)
+            # For anthropic/gemini text-parsed calls are uncommon; best-effort
+            # by re-using whatever asst_raw came back (no tool content blocks)
     if not tool_calls:
         # Pure text response
         _record_chat(user_message, text or "")
