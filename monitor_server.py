@@ -389,8 +389,10 @@ def build_system_prompt() -> str:
             lines.append(f"  printer_id=\"{p_['id']}\"  →  {p_.get('name', p_['id'])}")
     lines.append("")
     lines.append("Be concise and technically precise. Reference specific values when relevant.\n"
-    "IMPORTANT: When you need data, ALWAYS use the provided tools via structured "
-    "tool_calls — never output <function> tags or describe what you would do.")
+    "When calling tools, ALWAYS write a short natural-language sentence first "
+    "(e.g. 'Let me check that for you.' or 'Pulling the alert log now.') "
+    "before making the tool call — this gives the user immediate feedback.\n"
+    "IMPORTANT: Use only structured tool_calls — never output <function> tags.")
     lines.append("When taking actions, use tool calls rather than describing what you would do.")
     lines.append("For multi-printer operations use printer_id='all' where supported.")
     return "\n".join(lines)
@@ -875,6 +877,7 @@ def process_chat_agentic(user_message: str):
     _tier_map = {t["name"]: t["tier"] for t in TOOL_REGISTRY}
     max_tier  = max((_tier_map.get(a["tool"], 1) for a in expanded), default=1)
     # Tier 1 (read-only) always executes directly — no confirmation ever needed
+    preamble = _strip_function_tags(text).strip() if text else ""
     if max_tier == 1 or is_trust_active():
         final, exec_log = _execute_pending({
             "expanded": expanded, "tool_calls": tool_calls, "asst_raw": asst_raw,
@@ -882,7 +885,8 @@ def process_chat_agentic(user_message: str):
         final = _strip_function_tags(final)
         _record_chat(user_message, final)
         with chat_lock: hist = list(chat_history)
-        return {"type": "reply", "reply": final, "history": hist, "exec_log": exec_log}
+        return {"type": "reply", "reply": final, "history": hist,
+                "preamble": preamble, "exec_log": exec_log}
     # Queue for confirmation
     aid = uuid.uuid4().hex[:12]
     with pending_lock:
@@ -897,6 +901,7 @@ def process_chat_agentic(user_message: str):
         "action_id": aid,
         "is_multi": is_multi,
         "max_tier": max_tier,
+        "preamble": preamble,
         "actions": [{"tool": a["tool"], "printer_id": a["printer_id"],
                      "printer_name": a["printer_name"], "description": a["description"]}
                     for a in expanded]}
@@ -2428,6 +2433,12 @@ async function sendChat(){
         content:'\u26a0\ufe0f Error: '+(d.error||'Unknown error'),
         time:new Date().toISOString()});
       renderChatMessages();return;
+    }
+    // Show preamble bubble immediately (before action card or result)
+    if(d.preamble){
+      var now2=new Date().toISOString();
+      chatHistory.push({role:'assistant',content:d.preamble,time:now2});
+      renderChatMessages();
     }
     if(d.type==='reply'){
       chatHistory=d.history||chatHistory;
