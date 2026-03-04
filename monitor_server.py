@@ -442,6 +442,16 @@ TOOL_REGISTRY = [
      "parameters": {"type": "object", "properties": {
          "limit": {"type": "integer", "description": "Number of recent alerts to return (default 20, max 100)"}},
          "required": []}},
+    {"name": "get_pause_reason", "tier": 1,
+     "description": "Diagnose why a print is paused or was interrupted. "
+                    "Searches the Klipper log for filament sensor triggers, "
+                    "runout events, M600, collision detection, thermal errors, "
+                    "and any lines just before the PAUSE macro call. "
+                    "Use this instead of get_klippy_log when the user asks why "
+                    "a print paused, stopped, or was interrupted.",
+     "parameters": {"type": "object", "properties": {
+         "printer_id": {"type": "string", "description": "Printer ID"}},
+         "required": ["printer_id"]}},
     {"name": "get_klippy_log", "tier": 1,
      "description": "Fetch recent lines from the Klipper (klippy) log on a printer. "
                     "Contains pause reasons, error messages, macro triggers, "
@@ -670,6 +680,55 @@ def execute_tool(tool_name: str, args: dict, printer_id: str) -> str:
             names = [f.get("path", f.get("filename","?"))
                      for f in files[:int(args.get("limit", 20))]]
             return f"{nm} ({len(names)} files): " + ", ".join(names)
+        elif tool_name == "get_pause_reason":
+            host = pr["host"].rstrip("/")
+            tok  = pr.get("api_token", "")
+            raw  = ""
+            for path in ("/server/files/klippy.log",
+                         "/server/files/logs/klippy.log"):
+                try:
+                    hdrs = {"Accept": "text/plain, */*"}
+                    if tok: hdrs["X-Api-Key"] = tok
+                    req = urllib.request.Request(host + path, headers=hdrs)
+                    with urllib.request.urlopen(req, timeout=20) as resp:
+                        raw = resp.read().decode("utf-8", errors="replace")
+                    if raw: break
+                except Exception:
+                    pass
+            # Also check print_stats.message for inline reason
+            st  = printer_states.get(printer_id, {})
+            with st.get("lock", threading.Lock()): s = dict(st.get("last_status", {}))
+            ps_msg = (s.get("print_stats") or {}).get("message", "").strip()
+            if not raw:
+                result = f"{nm} pause reason from printer state: {ps_msg or 'none'}"
+                return result
+            all_lines = raw.splitlines()
+            # Keywords that indicate why a print was paused
+            triggers = ["runout", "filament", "sensor", "tangle", "entangl",
+                        "m600", "collision", "error", "shutdown", "overheat",
+                        "thermal", "pause", "cancel", "filament_change",
+                        "filament_switch", "filament_motion"]
+            # Find matching lines + 8 lines before each for context
+            matched = set()
+            for i, l in enumerate(all_lines):
+                ll = l.lower()
+                if any(kw in ll for kw in triggers):
+                    for j in range(max(0, i - 8), min(len(all_lines), i + 2)):
+                        matched.add(j)
+            relevant = [all_lines[i] for i in sorted(matched)]
+            # Only use the last 60 relevant lines (most recent events)
+            relevant = relevant[-60:]
+            parts = []
+            if ps_msg:
+                parts.append(f"Printer state message: {ps_msg}")
+            if relevant:
+                parts.append(f"Relevant Klipper log entries ({len(relevant)} lines):")
+                parts.extend(relevant)
+            else:
+                parts.append("No filament/sensor/error events found in Klipper log.")
+                parts.append("Last 30 log lines:")
+                parts.extend(all_lines[-30:])
+            return f"{nm} pause diagnosis:\n" + "\n".join(parts)
         elif tool_name == "get_klippy_log":
             lines_n = min(int(args.get("lines", 80)), 300)
             filt    = args.get("filter", "").strip().lower()
@@ -722,9 +781,16 @@ def execute_tool(tool_name: str, args: dict, printer_id: str) -> str:
                         "Readable via SSH at ~/printer_data/logs/klippy.log")
             all_lines = raw.splitlines()
             if filt:
-                all_lines = [l for l in all_lines if filt in l.lower()]
+                # Include N lines of context before each match (like grep -B)
+                ctx = int(args.get("context_lines", 5))
+                matched = set()
+                for i, l in enumerate(all_lines):
+                    if filt in l.lower():
+                        for j in range(max(0, i - ctx), i + 1):
+                            matched.add(j)
+                all_lines = [all_lines[i] for i in sorted(matched)]
             tail = all_lines[-lines_n:]
-            label = f" filtered:{repr(filt)}" if filt else ""
+            label = f" filtered:{repr(filt)} +{args.get('context_lines',5)} context lines" if filt else ""
             return (f"{nm} Klippy log (last {len(tail)} lines{label}):\n"
                     + "\n".join(tail))
         elif tool_name == "get_print_history":
@@ -786,6 +852,7 @@ def _action_description(tool: str, args: dict, printer_name: str) -> str:
         "list_files":         f"List files on {printer_name}",
         "get_alert_log":      "Get recent alert log",
         "get_print_history":  "Get Moonraker print job history",
+        "get_pause_reason":   "Diagnose why a print paused/stopped",
         "get_klippy_log":     "Read Klipper log (pause/error reasons)",
         "pause_print":        f"Pause print on {printer_name}",
         "resume_print":       f"Resume print on {printer_name}",
