@@ -761,11 +761,30 @@ def _execute_pending(pending: dict):
         print(f"  [Agent] {action['description']} → {r[:80]}")
         cid = action["call_id"]
         by_call.setdefault(cid, []).append(r)
-    # build tc_results aligned with original tool_calls
-    tc_results = [(tc, "\n".join(by_call.get(tc["id"], ["no result"])))
-                  for tc in pending["tool_calls"]]
-    final = adapter.chat_with_results(
-        pending["msg_payload"], pending["asst_raw"], tc_results, pending["system"])
+
+    # For text-parsed tool calls (fake IDs starting with "txt_"), the synthetic
+    # asst_raw can't be used in chat_with_results because Groq/OpenAI strictly
+    # validate that tool_call IDs in the assistant turn match tool role messages.
+    # Instead, make a fresh LLM call with the results embedded in a user message.
+    tool_calls = pending["tool_calls"]
+    is_text_parsed = tool_calls and tool_calls[0]["id"].startswith("txt_")
+    if is_text_parsed:
+        result_parts = [f"[{e['description']}]\n{e['result']}" for e in exec_log]
+        results_block = "\n\n".join(result_parts)
+        synthesis_msgs = list(pending["msg_payload"]) + [
+            {"role": "assistant", "content": pending.get("preamble") or
+             "Let me look that up for you."},
+            {"role": "user",      "content":
+             f"Here are the tool results:\n\n{results_block}\n\n"
+             f"Please give a clear, concise answer based on these results."}
+        ]
+        final = adapter.chat(synthesis_msgs, pending["system"], tools=[])[0] or ""
+    else:
+        # build tc_results aligned with original tool_calls
+        tc_results = [(tc, "\n".join(by_call.get(tc["id"], ["no result"])))
+                      for tc in tool_calls]
+        final = adapter.chat_with_results(
+            pending["msg_payload"], pending["asst_raw"], tc_results, pending["system"])
     return final, exec_log
 
 
@@ -839,6 +858,34 @@ def _make_oai_asst_raw(tool_calls: list, text) -> dict:
                        for tc in tool_calls]
     }
 
+
+def _save_preamble(user_msg: str, preamble: str):
+    """Store the user message + preamble assistant reply in chat history immediately,
+    so d.history contains both even before the tool result comes back."""
+    llm_cfg = config.get("llm", {})
+    now = datetime.now().isoformat()
+    with chat_lock:
+        chat_history.append({"role": "user",      "content": user_msg, "time": now})
+        chat_history.append({"role": "assistant",  "content": preamble,
+                              "time": datetime.now().isoformat()})
+        mx = llm_cfg.get("history_max_messages", 100)
+        while len(chat_history) > mx: chat_history.pop(0)
+    save_chat_history()
+
+def _record_result(user_msg: str, result: str, preamble_saved: bool = False):
+    """Append the tool result as an assistant message.
+    If preamble_saved=True the user turn is already in history — skip it."""
+    llm_cfg = config.get("llm", {})
+    now = datetime.now().isoformat()
+    with chat_lock:
+        if not preamble_saved:
+            chat_history.append({"role": "user", "content": user_msg, "time": now})
+        chat_history.append({"role": "assistant", "content": result,
+                              "time": datetime.now().isoformat()})
+        mx = llm_cfg.get("history_max_messages", 100)
+        while len(chat_history) > mx: chat_history.pop(0)
+    save_chat_history()
+
 def process_chat_agentic(user_message: str):
     """Agentic chat entry point. Returns a result dict the HTTP handler serialises."""
     llm_cfg = config.get("llm", {})
@@ -879,11 +926,14 @@ def process_chat_agentic(user_message: str):
     # Tier 1 (read-only) always executes directly — no confirmation ever needed
     preamble = _strip_function_tags(text).strip() if text else ""
     if max_tier == 1 or is_trust_active():
+        # Save preamble to history immediately so it persists in d.history
+        if preamble:
+            _save_preamble(user_message, preamble)
         final, exec_log = _execute_pending({
             "expanded": expanded, "tool_calls": tool_calls, "asst_raw": asst_raw,
-            "msg_payload": msg_payload, "system": system})
+            "msg_payload": msg_payload, "system": system, "preamble": preamble})
         final = _strip_function_tags(final)
-        _record_chat(user_message, final)
+        _record_result(user_message, final, bool(preamble))
         with chat_lock: hist = list(chat_history)
         return {"type": "reply", "reply": final, "history": hist,
                 "preamble": preamble, "exec_log": exec_log}
@@ -895,7 +945,11 @@ def process_chat_agentic(user_message: str):
             "asst_raw": asst_raw, "tool_calls": tool_calls, "expanded": expanded,
             "system": system, "is_multi": is_multi,
             "max_tier": max_tier,
+            "preamble": preamble,
             "created_at": datetime.now().isoformat()}
+    # Save preamble to history now so it shows even if action is denied
+    if preamble:
+        _save_preamble(user_message, preamble)
     return {
         "type": "pending_action",
         "action_id": aid,
@@ -921,7 +975,8 @@ def confirm_pending(action_id: str, confirmed: bool, trust_hours: int = 0):
         activate_trust(trust_hours)
     final, exec_log = _execute_pending(pending)
     final = _strip_function_tags(final)
-    _record_chat(pending["user_message"], final)
+    had_preamble = bool(pending.get("preamble"))
+    _record_result(pending["user_message"], final, had_preamble)
     with chat_lock: hist = list(chat_history)
     return {"type": "reply", "reply": final, "history": hist, "exec_log": exec_log}
 
@@ -2434,16 +2489,18 @@ async function sendChat(){
         time:new Date().toISOString()});
       renderChatMessages();return;
     }
-    // Show preamble bubble immediately (before action card or result)
-    if(d.preamble){
-      var now2=new Date().toISOString();
-      chatHistory.push({role:'assistant',content:d.preamble,time:now2});
-      renderChatMessages();
-    }
+    // Preamble: show instantly from server history (already saved server-side)
+    // so when d.history arrives it contains the preamble + result both.
     if(d.type==='reply'){
+      // Replace history entirely — server history has preamble + result
       chatHistory=d.history||chatHistory;
       renderChatMessages();
     }else if(d.type==='pending_action'){
+      // For pending actions: preamble is in server history, show it
+      if(d.preamble){
+        chatHistory=d.history||chatHistory; // pull saved preamble from server
+        renderChatMessages();
+      }
       renderPendingAction(d);
     }
   }catch(err){
