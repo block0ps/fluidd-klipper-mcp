@@ -54,7 +54,10 @@ poll_threads   = {}
 
 def _make_printer_state():
     return {"last_status": {}, "active_alerts": [], "fired_alerts": set(),
-            "last_poll": None, "errors": 0, "lock": threading.Lock()}
+            "last_poll": None, "errors": 0, "lock": threading.Lock(),
+            "paused_since": None,   # datetime when pause was first detected
+            "prev_print_state": None,  # last observed print_stats.state
+           }
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -124,6 +127,8 @@ def detect_anomalies(s):
         alerts.append(("warning", "Print was cancelled"))
     if state == "complete":
         alerts.append(("success", f"Print complete! {ps.get('filename','')}"))
+    if state == "paused":
+        alerts.append(("warning", f"Print paused at {prog*100:.1f}% — {ps.get('filename','')}"))
     return alerts
 
 # ── Alert channels ─────────────────────────────────────────────────────────────
@@ -245,27 +250,80 @@ def fetch_printer_status(printer):
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read()).get("result",{}).get("status",{})
 
+# How many minutes of continuous pause before escalating with a fresh alert.
+# Set to 0 to disable escalation (only fires on first pause detection).
+PAUSE_ESCALATE_MINUTES = 30
+
 def process_printer_status(printer, s):
     pid   = printer["id"]
     pname = printer.get("name", pid)
-    state = printer_states[pid]
-    with state["lock"]:
-        state["last_status"] = s
-        state["last_poll"]   = datetime.now().isoformat()
-    anomalies = detect_anomalies(s)
-    print_state = s.get("print_stats",{}).get("state","")
-    if print_state not in ("printing","paused"):
-        with state["lock"]: state["fired_alerts"].clear()
+    pst   = printer_states[pid]
+    now   = datetime.now()
+
+    with pst["lock"]:
+        pst["last_status"] = s
+        pst["last_poll"]   = now.isoformat()
+
+    anomalies   = detect_anomalies(s)
+    print_state = s.get("print_stats", {}).get("state", "")
+    prog        = s.get("virtual_sdcard", {}).get("progress", 0)
+    filename    = s.get("print_stats", {}).get("filename", "")
+
+    # ── State-transition bookkeeping ──────────────────────────────────────────
+    with pst["lock"]:
+        prev_state = pst.get("prev_print_state")
+        pst["prev_print_state"] = print_state
+
+    # Reset dedup when job ends (not printing or paused)
+    if print_state not in ("printing", "paused"):
+        with pst["lock"]:
+            pst["fired_alerts"].clear()
+            pst["paused_since"] = None
+
+    # ── Pause tracking + escalation ───────────────────────────────────────────
+    if print_state == "paused":
+        with pst["lock"]:
+            if pst["paused_since"] is None:
+                pst["paused_since"] = now   # record when pause started
+            paused_since = pst["paused_since"]
+
+        paused_minutes = (now - paused_since).total_seconds() / 60
+
+        if PAUSE_ESCALATE_MINUTES > 0 and paused_minutes >= PAUSE_ESCALATE_MINUTES:
+            # Fire an escalation alert every PAUSE_ESCALATE_MINUTES interval
+            # using a time-bucketed key so dedup allows one per window
+            bucket = int(paused_minutes // PAUSE_ESCALATE_MINUTES)
+            esc_key = f"warning:pause_escalation:{bucket}"
+            with pst["lock"]:
+                already_esc = esc_key in pst["fired_alerts"]
+            if not already_esc:
+                with pst["lock"]:
+                    pst["fired_alerts"].add(esc_key)
+                hrs  = int(paused_minutes) // 60
+                mins = int(paused_minutes) % 60
+                duration_str = (f"{hrs}h {mins}m" if hrs else f"{mins}m")
+                dispatch_alert(
+                    "warning",
+                    f"Still paused after {duration_str} at {prog*100:.1f}% — {filename}",
+                    pname)
+    else:
+        with pst["lock"]:
+            pst["paused_since"] = None   # clear if resumed
+
+    # ── Standard anomaly dispatch ─────────────────────────────────────────────
     for level, msg in anomalies:
         key = f"{level}:{msg}"
-        should_fire = (level in ("critical","success") or
-                       (level=="warning" and config.get("alert_on_warnings",True)))
-        with state["lock"]: already = key in state["fired_alerts"]
+        should_fire = (level in ("critical", "success") or
+                       (level == "warning" and config.get("alert_on_warnings", True)))
+        with pst["lock"]:
+            already = key in pst["fired_alerts"]
         if should_fire and not already:
-            with state["lock"]: state["fired_alerts"].add(key)
+            with pst["lock"]:
+                pst["fired_alerts"].add(key)
             dispatch_alert(level, msg, pname)
-    with state["lock"]:
-        state["active_alerts"] = [{"level":l,"msg":m} for l,m in anomalies]
+
+    with pst["lock"]:
+        pst["active_alerts"] = [{"level": l, "msg": m} for l, m in anomalies]
 
 def start_printer_thread(printer):
     pid = printer["id"]
