@@ -794,7 +794,7 @@ def _parse_text_tool_calls(text: str):
     return cleaned, calls
 
 
-def _make_oai_asst_raw(tool_calls: list, text: str | None) -> dict:
+def _make_oai_asst_raw(tool_calls: list, text) -> dict:
     """Build a synthetic OpenAI-style assistant raw block for text-parsed calls."""
     return {
         "content": text or None,
