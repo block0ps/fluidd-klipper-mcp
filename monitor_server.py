@@ -442,6 +442,12 @@ TOOL_REGISTRY = [
      "parameters": {"type": "object", "properties": {
          "limit": {"type": "integer", "description": "Number of recent alerts to return (default 20, max 100)"}},
          "required": []}},
+    {"name": "get_print_history", "tier": 1,
+     "description": "Get the Moonraker print job history for a printer: completed, cancelled, and in-progress jobs with filenames, timestamps, duration, and status. Use this to look up past prints, pauses, cancellations, or failures.",
+     "parameters": {"type": "object", "properties": {
+         "printer_id": {"type": "string", "description": "Printer ID"},
+         "limit": {"type": "integer", "description": "Number of recent jobs (default 10, max 50)"}},
+         "required": ["printer_id"]}},
     # ── Tier 2: reversible actions ────────────────────────────────────────────
     {"name": "pause_print", "tier": 2,
      "description": "Pause an active print job.",
@@ -640,6 +646,21 @@ def execute_tool(tool_name: str, args: dict, printer_id: str) -> str:
             names = [f.get("path", f.get("filename","?"))
                      for f in files[:int(args.get("limit", 20))]]
             return f"{nm} ({len(names)} files): " + ", ".join(names)
+        elif tool_name == "get_print_history":
+            limit = min(int(args.get("limit", 10)), 50)
+            d = _mkr_get(pr, f"/server/history/list?limit={limit}&order=desc")
+            jobs = d.get("result", {}).get("jobs", [])
+            if not jobs: return f"{nm}: No print history found."
+            lines = []
+            for j in jobs:
+                ts   = j.get("start_time", 0)
+                dt   = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M') if ts else '?'
+                dur  = int(j.get('print_duration', 0))
+                dstr = f'{dur//3600}h{(dur%3600)//60}m' if dur else '?'
+                st   = j.get('status', 'unknown')
+                fn   = j.get('filename', '?')
+                lines.append(f'[{dt}] {st.upper()} {fn} ({dstr})')
+            return f"{nm} print history (newest first):\n" + "\n".join(lines)
         elif tool_name == "pause_print":
             _mkr_post(pr, "/printer/print/pause"); return f"✓ Paused {nm}."
         elif tool_name == "resume_print":
@@ -683,6 +704,7 @@ def _action_description(tool: str, args: dict, printer_name: str) -> str:
         "get_printer_status": f"Get status of {printer_name}",
         "list_files":         f"List files on {printer_name}",
         "get_alert_log":      "Get recent alert log",
+        "get_print_history":  "Get Moonraker print job history",
         "pause_print":        f"Pause print on {printer_name}",
         "resume_print":       f"Resume print on {printer_name}",
         "set_temperature":    f"Set {args.get('heater','?')} → {args.get('temperature','?')}°C on {printer_name}",
