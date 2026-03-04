@@ -66,7 +66,8 @@ DEFAULT_CONFIG = {
         "anthropic": {"api_key": "", "model": "claude-haiku-4-5-20251001"},
         "openai":    {"api_key": "", "model": "gpt-4o-mini",
                       "base_url": "https://api.openai.com/v1"},
-        "ollama":    {"base_url": "http://localhost:11434", "model": "llama3.2"}
+        "ollama":    {"base_url": "http://localhost:11434", "model": "llama3.2"},
+        "gemini":    {"api_key": "", "model": "gemini-2.0-flash"}
     }
 }
 
@@ -206,6 +207,85 @@ class OllamaAdapter(LLMAdapter):
         with urllib.request.urlopen(req, timeout=120) as resp:
             data = json.loads(resp.read())
         return data.get("message", {}).get("content") or ""
+
+class GeminiAdapter(LLMAdapter):
+    """Google Gemini — free tier: 1 500 req/day on gemini-2.0-flash.
+    API key at https://aistudio.google.com (zero cost, no billing required)."""
+    BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+    def __init__(self, api_key: str, model: str = "gemini-2.0-flash"):
+        self.api_key = api_key; self.model = model
+
+    def _url(self, method: str) -> str:
+        return f"{self.BASE}/models/{self.model}:{method}?key={self.api_key}"
+
+    def _convert_messages(self, messages: list) -> list:
+        """Convert role/content messages to Gemini contents format."""
+        contents = []
+        for m in messages:
+            role = "model" if m["role"] == "assistant" else "user"
+            # Support pre-built Gemini content blocks (used in chat_with_results)
+            if isinstance(m.get("content"), list):
+                contents.append({"role": role, "parts": m["content"]})
+            else:
+                contents.append({"role": role,
+                                  "parts": [{"text": m.get("content") or ""}]})
+        return contents
+
+    def _fmt_tools(self, tools: list) -> list:
+        """Convert internal tool defs to Gemini function_declarations format."""
+        if not tools: return []
+        return [{"function_declarations": [
+            {"name": t["name"], "description": t["description"],
+             "parameters": t["parameters"]} for t in tools]}]
+
+    def chat(self, messages: list, system: str, tools: list = None):
+        contents = self._convert_messages(messages)
+        payload  = {"contents": contents,
+                    "systemInstruction": {"parts": [{"text": system}]},
+                    "generationConfig": {"maxOutputTokens": 2048}}
+        if tools:
+            payload["tools"] = self._fmt_tools(tools)
+        req = urllib.request.Request(
+            self._url("generateContent"),
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+        parts  = data["candidates"][0]["content"]["parts"]
+        text   = "\n".join(p["text"] for p in parts if "text" in p) or None
+        calls  = []
+        for i, p in enumerate(parts):
+            if "functionCall" in p:
+                fc = p["functionCall"]
+                calls.append({"id": f"gemini_call_{i}", "name": fc["name"],
+                               "args": fc.get("args", {}), "raw": p})
+        # Store the raw model content for chat_with_results
+        raw = {"parts": parts, "role": "model"}
+        return text, calls, raw
+
+    def chat_with_results(self, msgs, asst_raw, tc_results, system):
+        # Reconstruct the full contents including model tool call + function responses
+        contents = self._convert_messages(msgs)
+        contents.append({"role": "model", "parts": asst_raw["parts"]})
+        # Add function responses as a single user turn
+        resp_parts = [
+            {"functionResponse": {"name": tc["name"],
+                                   "response": {"result": result}}}
+            for tc, result in tc_results]
+        contents.append({"role": "user", "parts": resp_parts})
+        payload = {"contents": contents,
+                   "systemInstruction": {"parts": [{"text": system}]},
+                   "generationConfig": {"maxOutputTokens": 2048}}
+        req = urllib.request.Request(
+            self._url("generateContent"),
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+        parts = data["candidates"][0]["content"]["parts"]
+        return "\n".join(p["text"] for p in parts if "text" in p) or ""
+
 def get_llm_adapter() -> LLMAdapter:
     """Instantiate the active LLM adapter from config. Raises ValueError if misconfigured."""
     llm  = config.get("llm", {})
@@ -225,6 +305,11 @@ def get_llm_adapter() -> LLMAdapter:
         base  = llm.get("ollama", {}).get("base_url", "http://localhost:11434")
         model = llm.get("ollama", {}).get("model", "llama3.2")
         return OllamaAdapter(base, model)
+    elif prov == "gemini":
+        key   = llm.get("gemini", {}).get("api_key", "").strip()
+        model = llm.get("gemini", {}).get("model", "gemini-2.0-flash")
+        if not key: raise ValueError("Gemini API key not configured.")
+        return GeminiAdapter(key, model)
     else:
         raise ValueError(f"Unknown LLM provider: {prov!r}")
 
@@ -1607,6 +1692,7 @@ body.fleet-mode .container{max-width:1120px}
             <option value="anthropic">Anthropic (Claude)</option>
             <option value="openai">OpenAI-compatible (Groq, Mistral, LM Studio&hellip;)</option>
             <option value="ollama">Ollama (local / offline)</option>
+            <option value="gemini">Google Gemini (free tier)</option>
           </select>
         </div>
         <div class="cs-group" id="csApiKeyGroup">
@@ -2115,7 +2201,7 @@ function updateChatProvBadge(){
     var llm=cfg.llm||{};
     var on=!!llm.enabled;
     var prov=llm.provider||'anthropic';
-    var labels={'anthropic':'Claude','openai':'OpenAI','ollama':'Ollama'};
+    var labels={'anthropic':'Claude','openai':'OpenAI','ollama':'Ollama','gemini':'Gemini'};
     var badge=document.getElementById('chatProvBadge');
     if(badge){
       badge.textContent=on?(labels[prov]||prov):'off';
@@ -2391,6 +2477,11 @@ function openChatSettings(){
         (llm.ollama&&llm.ollama.base_url)||'http://localhost:11434';
       document.getElementById('csModel').value=
         (llm.ollama&&llm.ollama.model)||'llama3.2';
+    }else if(prov==='gemini'){
+      document.getElementById('csApiKey').value=
+        (llm.gemini&&llm.gemini.api_key)?'\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7':'';
+      document.getElementById('csModel').value=
+        (llm.gemini&&llm.gemini.model)||'gemini-2.0-flash';
     }
     csProviderChange();
     // Agent settings
@@ -2419,6 +2510,13 @@ function openChatSettings(){
   });
 }
 
+function csTierChange(){
+  // Tier 3 cannot be set via UI — selector only shows 1 and 2.
+  // If tier3 is currently active (injected server-side), show the T3 section.
+  var sel=document.getElementById('csTier');
+  if(sel)sel.value=Math.min(2,parseInt(sel.value)||2);
+}
+
 function csPollSliderChange(v){
   var n=parseInt(v);
   document.getElementById('csPollLabel').textContent=n>=60?'60 min (max)':n+' min';
@@ -2435,8 +2533,17 @@ function csProviderChange(){
     prov==='ollama'?'none':'block';
   document.getElementById('csBaseUrlGroup').style.display=
     prov!=='anthropic'?'block':'none';
-  var ph={'anthropic':'claude-haiku-4-5-20251001','openai':'gpt-4o-mini','ollama':'llama3.2'};
+  var ph={'anthropic':'claude-haiku-4-5-20251001','openai':'gpt-4o-mini',
+          'ollama':'llama3.2','gemini':'gemini-2.0-flash'};
   document.getElementById('csModel').placeholder=ph[prov]||'model-name';
+  // Gemini uses API key but no base URL
+  if(prov==='gemini'){
+    document.getElementById('csApiKeyGroup').style.display='block';
+    document.getElementById('csBaseUrlGroup').style.display='none';
+    document.getElementById('csApiKey').placeholder='AIza...';
+  }else{
+    document.getElementById('csApiKey').placeholder='sk-\u2026';
+  }
 }
 
 async function saveChatSettings(){
@@ -2470,6 +2577,10 @@ async function saveChatSettings(){
   }else if(prov==='ollama'){
     payload.llm.ollama={model:model||'llama3.2',
       base_url:baseUrl||'http://localhost:11434'};
+  }else if(prov==='gemini'){
+    payload.llm.gemini={model:model||'gemini-2.0-flash'};
+    if(apiKey&&apiKey!=='\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7')
+      payload.llm.gemini.api_key=apiKey;
   }
   try{
     var r=await fetch('/api/settings',{method:'PATCH',
@@ -2613,7 +2724,7 @@ class Handler(BaseHTTPRequestHandler):
             for ch in ("twilio","email"):
                 for k in ("auth_token","password"):
                     if safe.get(ch,{}).get(k): safe[ch][k] = "••••••••"
-            for _prov in ("anthropic","openai"):
+            for _prov in ("anthropic","openai","gemini"):
                 if safe.get("llm",{}).get(_prov,{}).get("api_key"):
                     safe["llm"][_prov]["api_key"] = "••••••••"
             self.send_json(200, safe)
@@ -2774,7 +2885,7 @@ class Handler(BaseHTTPRequestHandler):
                 for k in ("enabled","provider","history_enabled","history_max_messages"):
                     if k in llm_patch:
                         llm_conf[k] = llm_patch[k]
-                for prov in ("anthropic","openai","ollama"):
+                for prov in ("anthropic","openai","ollama","gemini"):
                     if prov in llm_patch:
                         llm_conf.setdefault(prov, {}).update(llm_patch[prov])
                 changed = True
@@ -2896,9 +3007,11 @@ def cli_configure_llm():
     print("    1. anthropic  — Anthropic Claude (cloud)")
     print("    2. openai     — OpenAI-compatible  (Groq, Mistral, LM Studio, Together...)")
     print("    3. ollama     — Ollama (local, no API key needed)")
-    choice = input("  Select [1/2/3] (default 1): ").strip()
-    prov_map = {"1":"anthropic","2":"openai","3":"ollama",
-                "anthropic":"anthropic","openai":"openai","ollama":"ollama"}
+    print("    4. gemini     — Google Gemini (free tier: 1500 req/day)")
+    choice = input("  Select [1/2/3/4] (default 1): ").strip()
+    prov_map = {"1":"anthropic","2":"openai","3":"ollama","4":"gemini",
+                "anthropic":"anthropic","openai":"openai",
+                "ollama":"ollama","gemini":"gemini"}
     prov = prov_map.get(choice, "anthropic")
     upd  = {"enabled": True, "provider": prov}
     if prov == "anthropic":
@@ -2914,6 +3027,11 @@ def cli_configure_llm():
         base  = input("  Ollama URL [http://localhost:11434]: ").strip() or "http://localhost:11434"
         model = input("  Model [llama3.2]: ").strip() or "llama3.2"
         upd["ollama"] = {"base_url": base, "model": model}
+    elif prov == "gemini":
+        print("  Get a free API key at: https://aistudio.google.com")
+        key   = input("  Gemini API key (AIza...): ").strip()
+        model = input("  Model [gemini-2.0-flash]: ").strip() or "gemini-2.0-flash"
+        upd["gemini"] = {"api_key": key, "model": model}
     hist = input("\n  Persist chat history across restarts? [Y/n]: ").strip().lower()
     upd["history_enabled"] = hist not in ("n","no")
     max_h = input("  Max messages to keep [100]: ").strip()
@@ -3003,7 +3121,9 @@ if __name__ == "__main__":
     if llm_cfg.get("enabled"):
         _prov  = llm_cfg.get("provider","anthropic")
         _model = llm_cfg.get(_prov,{}).get("model","?")
-        _ls    = f"ON  ({_prov} / {_model})"
+        _prov_labels = {"anthropic":"Anthropic","openai":"OpenAI-compat",
+                        "ollama":"Ollama (local)","gemini":"Gemini (free)"}
+        _ls    = f"ON  ({_prov_labels.get(_prov,_prov)} / {_model})"
     else:
         _ls    = "OFF  (run: python3 monitor_server.py configure-llm)"
     print(f"  AI Chat  : {_ls}")
