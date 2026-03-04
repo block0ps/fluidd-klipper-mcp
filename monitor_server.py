@@ -338,6 +338,68 @@ def get_printer_by_id(pid):
 
 # ── Anomaly detection ──────────────────────────────────────────────────────────
 
+def _extract_pause_reason(s: dict) -> str:
+    """Return the most likely human-readable cause of the current pause.
+    Looks at print_stats.message, display_status.message, and the recent
+    gcode_store for M118 notifications fired just before the pause."""
+
+    # 1. print_stats.message — Klipper sets this on macro-initiated pauses
+    ps_msg = s.get("print_stats", {}).get("message", "").strip()
+    if ps_msg:
+        return ps_msg
+
+    # 2. display_status.message — set by M117; skip generic "Last File:" entries
+    ds_msg = s.get("display_status", {}).get("message", "").strip()
+    if ds_msg and not ds_msg.lower().startswith("last file"):
+        return ds_msg
+
+    # 3. Scan gcode_store for recent //notification messages (M118 output).
+    #    Take the most recent non-noise notification from the last 90 seconds.
+    store = s.get("_gcode_store", [])
+    if not store:
+        return ""
+
+    now = time.time()
+    candidates = []
+    for entry in reversed(store):           # newest first
+        if now - entry.get("time", 0) > 90: # only look 90 s back
+            break
+        msg = entry.get("message", "")
+        if entry.get("type") != "response":
+            continue
+        # M118 output arrives with "// " prefix
+        if not msg.startswith("//"):
+            continue
+        clean = msg.lstrip("/ ").strip()
+        if not clean or _is_noise(clean):
+            continue
+        candidates.append(clean)
+
+    return candidates[0] if candidates else ""
+
+# Human-readable hint appended to the pause alert based on the trigger text
+_PAUSE_HINTS = [
+    (("filament motion sensor", "entangl", "tangle"),
+     " — Filament motion/entanglement trigger. Resume printing if transient."),
+    (("runout", "ran out", "no filament"),
+     " — Filament runout detected. Load new filament before resuming."),
+    (("m600", "filament change"),
+     " — Filament change requested (M600). Swap filament and resume."),
+    (("power loss", "interruption", "was_interrupted"),
+     " — Possible power-loss recovery. Check print progress before resuming."),
+    (("thermal", "temperature", "temp"),
+     " — Thermal event. Check temperatures before resuming."),
+    (("clog", "under-extrusion", "underextrusion"),
+     " — Possible clog or under-extrusion. Check extruder before resuming."),
+]
+
+def _classify_pause_hint(reason: str) -> str:
+    lo = reason.lower()
+    for keywords, hint in _PAUSE_HINTS:
+        if any(k in lo for k in keywords):
+            return hint
+    return ""
+
 def detect_anomalies(s):
     alerts = []
     ps  = s.get("print_stats",    {})
@@ -371,7 +433,13 @@ def detect_anomalies(s):
     if state == "complete":
         alerts.append(("success", f"Print complete! {ps.get('filename','')}"))
     if state == "paused":
-        alerts.append(("warning", f"Print paused at {prog*100:.1f}% — {ps.get('filename','')}"))
+        reason = _extract_pause_reason(s)
+        fname  = ps.get("filename","").lstrip(".cache/")
+        base   = f"Print paused at {prog*100:.1f}% — {fname}"
+        if reason:
+            base += f"\n  Trigger: {reason}"
+            base += _classify_pause_hint(reason)
+        alerts.append(("warning", base))
     return alerts
 
 # ── Alert channels ─────────────────────────────────────────────────────────────
@@ -482,16 +550,40 @@ def dispatch_alert(level, msg, printer_name="Printer"):
 
 # ── Polling ─────────────────────────────────────────────────────────────────────
 
+# Notification messages we don't want to surface as pause reasons
+_NOISE_PATTERNS = (
+    "filament width sensor", "filament dia (measured", "filament width measurements",
+    "pressure_advance", "b:", "t0:", "t1:", "stats ", "mcu_awake",
+)
+
+def _is_noise(msg: str) -> bool:
+    lo = msg.lower().lstrip("/ ")
+    return any(lo.startswith(p) for p in _NOISE_PATTERNS)
+
 def fetch_printer_status(printer):
     host  = printer["host"].rstrip("/")
     token = printer.get("api_token","")
     hdrs  = {"Accept": "application/json"}
     if token: hdrs["X-Api-Key"] = token
+
     url = (host + "/printer/objects/query"
            "?print_stats&extruder&heater_bed&toolhead&virtual_sdcard&webhooks&display_status")
     req = urllib.request.Request(url, headers=hdrs)
     with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read()).get("result",{}).get("status",{})
+        status = json.loads(resp.read()).get("result",{}).get("status",{})
+
+    # Also fetch recent gcode notifications (M118 messages, macro output, etc.)
+    # These carry pause reasons, filament sensor triggers, etc.
+    try:
+        gs_url = host + "/server/gcode_store?count=40"
+        gs_req = urllib.request.Request(gs_url, headers=hdrs)
+        with urllib.request.urlopen(gs_req, timeout=10) as resp:
+            gs = json.loads(resp.read()).get("result",{}).get("gcode_store",[])
+        status["_gcode_store"] = gs
+    except Exception:
+        status["_gcode_store"] = []
+
+    return status
 
 # How many minutes of continuous pause before escalating with a fresh alert.
 # Set to 0 to disable escalation (only fires on first pause detection).
