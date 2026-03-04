@@ -446,7 +446,9 @@ TOOL_REGISTRY = [
      "description": "Fetch recent lines from the Klipper (klippy) log on a printer. "
                     "Contains pause reasons, error messages, macro triggers, "
                     "filament sensor events, and other Klipper system messages. "
-                    "Use when the user asks why a print paused, failed, or errored.",
+                    "When asked why a print paused or failed, call this with "
+                    "filter='pause' or filter='error' to find the cause. "
+                    "Call without filter to get the raw recent log.",
      "parameters": {"type": "object", "properties": {
          "printer_id": {"type": "string", "description": "Printer ID"},
          "lines": {"type": "integer", "description": "Number of recent log lines (default 80, max 300)"},
@@ -671,34 +673,60 @@ def execute_tool(tool_name: str, args: dict, printer_id: str) -> str:
         elif tool_name == "get_klippy_log":
             lines_n = min(int(args.get("lines", 80)), 300)
             filt    = args.get("filter", "").strip().lower()
-            # Moonraker exposes the klippy log via /server/logs/klippy or /access/log
-            # Try /server/logs/klippy first (Moonraker ≥0.8), then /access/log
-            raw = ""
-            for endpoint in ("/server/logs/klippy", "/access/log"):
+            host    = pr["host"].rstrip("/")
+            tok     = pr.get("api_token", "")
+            raw     = ""
+            # Moonraker serves the klippy log as a raw file download.
+            # Try the most common paths in order.
+            for path in ("/server/files/klippy.log",
+                         "/server/files/logs/klippy.log"):
                 try:
-                    d = _mkr_get(pr, endpoint)
-                    raw = d.get("result", {}).get("log", "") or d.get("result", "") or ""
-                    if raw: break
+                    hdrs = {"Accept": "text/plain, */*"}
+                    if tok: hdrs["X-Api-Key"] = tok
+                    req = urllib.request.Request(host + path, headers=hdrs)
+                    with urllib.request.urlopen(req, timeout=20) as resp:
+                        raw = resp.read().decode("utf-8", errors="replace")
+                    if raw:
+                        break
                 except Exception:
                     pass
+            # Fallback: /server/info tells us where the log file is
             if not raw:
-                # Fallback: read the log file path if configured in Moonraker
                 try:
                     info = _mkr_get(pr, "/server/info")
-                    log_path = info.get("result", {}).get("klippy_log_file", "")
+                    log_path = (info.get("result") or {}).get("klippy_log_file", "")
                     if log_path:
-                        raw = f"[Log path: {log_path} — fetch it directly to read contents]"
+                        # Try fetching it by constructing the download URL
+                        fname = log_path.split("/")[-1]
+                        for path in (f"/server/files/{fname}",
+                                     f"/server/files/logs/{fname}"):
+                            try:
+                                hdrs = {"Accept": "text/plain, */*"}
+                                if tok: hdrs["X-Api-Key"] = tok
+                                req = urllib.request.Request(host + path, headers=hdrs)
+                                with urllib.request.urlopen(req, timeout=20) as resp:
+                                    raw = resp.read().decode("utf-8", errors="replace")
+                                if raw:
+                                    break
+                            except Exception:
+                                pass
+                        if not raw:
+                            return (f"{nm}: Log file is at {log_path} on the printer "
+                                    "but could not be downloaded via HTTP. "
+                                    "Connect via SSH to read it.")
                 except Exception:
                     pass
             if not raw:
-                return (f"{nm}: Could not retrieve Klippy log via Moonraker API. "
-                        "The log may be accessible via SSH at ~/printer_data/logs/klippy.log")
+                return (f"{nm}: Could not retrieve Klippy log. Tried "
+                        "/server/files/klippy.log and /server/files/logs/klippy.log. "
+                        "Readable via SSH at ~/printer_data/logs/klippy.log")
             all_lines = raw.splitlines()
-            # Filter if requested
             if filt:
                 all_lines = [l for l in all_lines if filt in l.lower()]
             tail = all_lines[-lines_n:]
-            return f"{nm} Klippy log (last {len(tail)} lines{' filtered by ' + repr(filt) if filt else ''}):\n" + "\n".join(tail)
+            label = f" filtered:{repr(filt)}" if filt else ""
+            return (f"{nm} Klippy log (last {len(tail)} lines{label}):\n"
+                    + "\n".join(tail))
         elif tool_name == "get_print_history":
             limit = min(int(args.get("limit", 10)), 50)
             d = _mkr_get(pr, f"/server/history/list?limit={limit}&order=desc")
