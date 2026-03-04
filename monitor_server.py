@@ -442,6 +442,16 @@ TOOL_REGISTRY = [
      "parameters": {"type": "object", "properties": {
          "limit": {"type": "integer", "description": "Number of recent alerts to return (default 20, max 100)"}},
          "required": []}},
+    {"name": "get_klippy_log", "tier": 1,
+     "description": "Fetch recent lines from the Klipper (klippy) log on a printer. "
+                    "Contains pause reasons, error messages, macro triggers, "
+                    "filament sensor events, and other Klipper system messages. "
+                    "Use when the user asks why a print paused, failed, or errored.",
+     "parameters": {"type": "object", "properties": {
+         "printer_id": {"type": "string", "description": "Printer ID"},
+         "lines": {"type": "integer", "description": "Number of recent log lines (default 80, max 300)"},
+         "filter": {"type": "string", "description": "Optional keyword to filter lines (e.g. 'pause', 'error', 'sensor')"}},
+         "required": ["printer_id"]}},
     {"name": "get_print_history", "tier": 1,
      "description": "Get the Moonraker print job history for a printer: completed, cancelled, and in-progress jobs with filenames, timestamps, duration, and status. Use this to look up past prints, pauses, cancellations, or failures.",
      "parameters": {"type": "object", "properties": {
@@ -634,11 +644,23 @@ def execute_tool(tool_name: str, args: dict, printer_id: str) -> str:
             with st.get("lock", threading.Lock()): s = dict(st.get("last_status", {}))
             ps  = s.get("print_stats", {}); ext = s.get("extruder", {})
             bed = s.get("heater_bed", {}); vsd = s.get("virtual_sdcard", {})
-            return (f"{nm}: {ps.get('state','unknown').upper()} "
-                    f"{vsd.get('progress',0)*100:.1f}% | "
-                    f"Hotend {ext.get('temperature',0):.1f}/{ext.get('target',0)}°C | "
-                    f"Bed {bed.get('temperature',0):.1f}/{bed.get('target',0)}°C | "
-                    f"File: {ps.get('filename','none')}")
+            info   = ps.get("info") or {}
+            layer  = info.get("current_layer"); tot_l = info.get("total_layer")
+            layer_str = f"Layer {layer}/{tot_l}" if layer else "Layer ?/?"
+            dur    = int(ps.get("print_duration", 0))
+            dur_str = f"{dur//3600}h{(dur%3600)//60}m{dur%60}s"
+            msg    = ps.get("message", "").strip()
+            parts  = [
+                f"{nm}: {ps.get('state','unknown').upper()} {vsd.get('progress',0)*100:.1f}%",
+                f"Layer: {layer_str}",
+                f"Duration: {dur_str}",
+                f"Hotend {ext.get('temperature',0):.1f}/{ext.get('target',0)}°C",
+                f"Bed {bed.get('temperature',0):.1f}/{bed.get('target',0)}°C",
+                f"File: {ps.get('filename','none')}",
+            ]
+            if msg:
+                parts.append(f"Message/reason: {msg}")
+            return " | ".join(parts)
         elif tool_name == "list_files":
             d = _mkr_get(pr, "/server/files/list?root=gcodes")
             files = sorted(d.get("result", []),
@@ -646,6 +668,37 @@ def execute_tool(tool_name: str, args: dict, printer_id: str) -> str:
             names = [f.get("path", f.get("filename","?"))
                      for f in files[:int(args.get("limit", 20))]]
             return f"{nm} ({len(names)} files): " + ", ".join(names)
+        elif tool_name == "get_klippy_log":
+            lines_n = min(int(args.get("lines", 80)), 300)
+            filt    = args.get("filter", "").strip().lower()
+            # Moonraker exposes the klippy log via /server/logs/klippy or /access/log
+            # Try /server/logs/klippy first (Moonraker ≥0.8), then /access/log
+            raw = ""
+            for endpoint in ("/server/logs/klippy", "/access/log"):
+                try:
+                    d = _mkr_get(pr, endpoint)
+                    raw = d.get("result", {}).get("log", "") or d.get("result", "") or ""
+                    if raw: break
+                except Exception:
+                    pass
+            if not raw:
+                # Fallback: read the log file path if configured in Moonraker
+                try:
+                    info = _mkr_get(pr, "/server/info")
+                    log_path = info.get("result", {}).get("klippy_log_file", "")
+                    if log_path:
+                        raw = f"[Log path: {log_path} — fetch it directly to read contents]"
+                except Exception:
+                    pass
+            if not raw:
+                return (f"{nm}: Could not retrieve Klippy log via Moonraker API. "
+                        "The log may be accessible via SSH at ~/printer_data/logs/klippy.log")
+            all_lines = raw.splitlines()
+            # Filter if requested
+            if filt:
+                all_lines = [l for l in all_lines if filt in l.lower()]
+            tail = all_lines[-lines_n:]
+            return f"{nm} Klippy log (last {len(tail)} lines{' filtered by ' + repr(filt) if filt else ''}):\n" + "\n".join(tail)
         elif tool_name == "get_print_history":
             limit = min(int(args.get("limit", 10)), 50)
             d = _mkr_get(pr, f"/server/history/list?limit={limit}&order=desc")
@@ -705,6 +758,7 @@ def _action_description(tool: str, args: dict, printer_name: str) -> str:
         "list_files":         f"List files on {printer_name}",
         "get_alert_log":      "Get recent alert log",
         "get_print_history":  "Get Moonraker print job history",
+        "get_klippy_log":     "Read Klipper log (pause/error reasons)",
         "pause_print":        f"Pause print on {printer_name}",
         "resume_print":       f"Resume print on {printer_name}",
         "set_temperature":    f"Set {args.get('heater','?')} → {args.get('temperature','?')}°C on {printer_name}",
