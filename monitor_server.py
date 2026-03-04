@@ -44,6 +44,7 @@ DEFAULT_CONFIG = {
          "enabled": True, "api_token": ""}
     ],
     "poll_interval_seconds": 1800,
+    "pause_escalate_minutes": 30,
     "alert_on_warnings": True,
     "ntfy":     {"enabled": False, "topic": "my-printer-alerts", "server": "https://ntfy.sh"},
     "twilio":   {"enabled": False, "account_sid": "", "auth_token": "",
@@ -587,8 +588,6 @@ def fetch_printer_status(printer):
 
 # How many minutes of continuous pause before escalating with a fresh alert.
 # Set to 0 to disable escalation (only fires on first pause detection).
-PAUSE_ESCALATE_MINUTES = 30
-
 def process_printer_status(printer, s):
     pid   = printer["id"]
     pname = printer.get("name", pid)
@@ -624,10 +623,10 @@ def process_printer_status(printer, s):
 
         paused_minutes = (now - paused_since).total_seconds() / 60
 
-        if PAUSE_ESCALATE_MINUTES > 0 and paused_minutes >= PAUSE_ESCALATE_MINUTES:
-            # Fire an escalation alert every PAUSE_ESCALATE_MINUTES interval
-            # using a time-bucketed key so dedup allows one per window
-            bucket = int(paused_minutes // PAUSE_ESCALATE_MINUTES)
+        _esc_mins = config.get("pause_escalate_minutes", 30)
+        if _esc_mins > 0 and paused_minutes >= _esc_mins:
+            # Fire one escalation alert per window; bucket = which window we are in
+            bucket = int(paused_minutes // _esc_mins)
             esc_key = f"warning:pause_escalation:{bucket}"
             with pst["lock"]:
                 already_esc = esc_key in pst["fired_alerts"]
@@ -1155,6 +1154,33 @@ body.fleet-mode .container{max-width:1120px}
             </label>
           </div>
         </div>
+        <div class="cs-group">
+          <div class="cs-lbl">Monitor &mdash; Polling</div>
+          <div class="cs-row" style="align-items:flex-start;flex-direction:column;gap:6px">
+            <div style="display:flex;align-items:center;justify-content:space-between;width:100%">
+              <span class="cs-row-lbl">Poll interval</span>
+              <span id="csPollLabel" style="font-size:11px;color:#4ade80;font-weight:700">30 min</span>
+            </div>
+            <input type="range" id="csPollSlider" min="5" max="60" step="5" value="30"
+              style="width:100%;accent-color:#3b82f6;cursor:pointer"
+              oninput="csPollSliderChange(this.value)"/>
+            <div style="display:flex;justify-content:space-between;width:100%;font-size:9px;color:#334155">
+              <span>5 min</span><span>15</span><span>30</span><span>45</span><span>60 min</span>
+            </div>
+          </div>
+        </div>
+        <div class="cs-group">
+          <div class="cs-lbl">Pause escalation</div>
+          <div class="cs-row">
+            <span class="cs-row-lbl">Re-alert if still paused every</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:7px;margin-top:2px">
+            <input class="cs-input" id="csEscalateMinutes" type="number"
+              min="0" max="240" step="5" value="30"
+              style="width:70px;text-align:center"/>
+            <span style="font-size:11px;color:#475569">min &nbsp;(0 = once only)</span>
+          </div>
+        </div>
         <div class="cs-status" id="csStatus"></div>
       </div>
       <div class="cs-footer">
@@ -1679,6 +1705,13 @@ function openChatSettings(){
     document.getElementById('csEnabled').checked=!!llm.enabled;
     document.getElementById('csProvider').value=prov;
     document.getElementById('csHistoryEnabled').checked=llm.history_enabled!==false;
+    var pollMin=Math.round((cfg.poll_interval_seconds||1800)/60);
+    // Clamp to slider range 5-60; values outside (e.g. 90 min) show as 60
+    var sliderVal=Math.min(60,Math.max(5,pollMin));
+    document.getElementById('csPollSlider').value=sliderVal;
+    csPollSliderChange(sliderVal);
+    document.getElementById('csEscalateMinutes').value=
+      cfg.pause_escalate_minutes!=null?cfg.pause_escalate_minutes:30;
     if(prov==='anthropic'){
       document.getElementById('csApiKey').value=
         (llm.anthropic&&llm.anthropic.api_key)?'\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7':'';
@@ -1699,6 +1732,11 @@ function openChatSettings(){
     }
     csProviderChange();
   });
+}
+
+function csPollSliderChange(v){
+  var n=parseInt(v);
+  document.getElementById('csPollLabel').textContent=n>=60?'60 min (max)':n+' min';
 }
 
 function closeChatSettings(){
@@ -1725,7 +1763,13 @@ async function saveChatSettings(){
   var baseUrl=document.getElementById('csBaseUrl').value.trim();
   var status=document.getElementById('csStatus');
   status.textContent='Saving\u2026';status.style.color='#475569';
-  var payload={llm:{enabled:enabled,provider:prov,history_enabled:histOn}};
+  var pollSecs=parseInt(document.getElementById('csPollSlider').value)*60;
+  var escMins=parseInt(document.getElementById('csEscalateMinutes').value)||0;
+  var payload={
+    poll_interval_seconds: pollSecs,
+    pause_escalate_minutes: escMins,
+    llm:{enabled:enabled,provider:prov,history_enabled:histOn}
+  };
   if(prov==='anthropic'){
     payload.llm.anthropic={model:model||'claude-haiku-4-5-20251001'};
     if(apiKey&&apiKey!=='\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7')
@@ -1747,6 +1791,10 @@ async function saveChatSettings(){
     if(r.ok){
       status.textContent='\u2705 Saved!';status.style.color='#4ade80';
       updateChatProvBadge();
+      // Refresh footer interval label
+      var m=Math.round(pollSecs/60);
+      var lbl=document.getElementById('intervalLabel');
+      if(lbl)lbl.textContent=m>=60?(m/60)+'h':m+' min';
       setTimeout(function(){status.textContent='';},2500);
     }else{status.textContent=d.error||'Error.';status.style.color='#ef4444';}
   }catch(e){status.textContent='Failed: '+e.message;status.style.color='#ef4444';}
@@ -1975,7 +2023,19 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
 
         if path == "/api/settings":
-            body     = self._read_body()
+            body = self._read_body()
+            changed = False
+            # ── Poll interval (min 300 s = 5 min, max 86400 s = 24 h) ──
+            if "poll_interval_seconds" in body:
+                val = int(body["poll_interval_seconds"])
+                config["poll_interval_seconds"] = max(300, min(val, 86400))
+                changed = True
+            # ── Pause escalation window (0 = disabled, else >= 5 min) ──
+            if "pause_escalate_minutes" in body:
+                val = int(body["pause_escalate_minutes"])
+                config["pause_escalate_minutes"] = 0 if val == 0 else max(5, val)
+                changed = True
+            # ── LLM settings ──
             if "llm" in body:
                 llm_patch = body["llm"]
                 llm_conf  = config.setdefault("llm", {})
@@ -1985,8 +2045,11 @@ class Handler(BaseHTTPRequestHandler):
                 for prov in ("anthropic","openai","ollama"):
                     if prov in llm_patch:
                         llm_conf.setdefault(prov, {}).update(llm_patch[prov])
-                save_config()
-            self.send_json(200, {"ok": True}); return
+                changed = True
+            if changed: save_config()
+            self.send_json(200, {"ok": True,
+                "poll_interval_seconds": config.get("poll_interval_seconds", 1800),
+                "pause_escalate_minutes": config.get("pause_escalate_minutes", 30)}); return
 
         if not path.startswith("/api/printers/"):
             self.send_response(404); self.end_headers(); return
