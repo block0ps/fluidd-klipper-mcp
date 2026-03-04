@@ -144,7 +144,8 @@ class OpenAIAdapter(LLMAdapter):
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode(),
             headers={"Authorization": f"Bearer {self.api_key}",
-                     "Content-Type": "application/json"}, method="POST")
+                     "Content-Type": "application/json",
+                     "User-Agent": "Mozilla/5.0 (compatible; FleetMonitor/1.0)"}, method="POST")
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read())
         msg = data["choices"][0]["message"]
@@ -165,7 +166,8 @@ class OpenAIAdapter(LLMAdapter):
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode(),
             headers={"Authorization": f"Bearer {self.api_key}",
-                     "Content-Type": "application/json"}, method="POST")
+                     "Content-Type": "application/json",
+                     "User-Agent": "Mozilla/5.0 (compatible; FleetMonitor/1.0)"}, method="POST")
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read())
         return data["choices"][0]["message"].get("content") or ""
