@@ -764,33 +764,63 @@ def _execute_pending(pending: dict):
     return final, exec_log
 
 
+def _strip_function_tags(text: str) -> str:
+    """Remove any remaining <function>...</function> tags from text (safety net)."""
+    if not text or '<function' not in text:
+        return text
+    # Remove complete <function>name{...}</function> blocks
+    text = re.sub(r'<function>\w+\{[^}]*\}</function>', '', text, flags=re.DOTALL)
+    # Remove bare <function>name</function> (no args)
+    text = re.sub(r'<function>\w+</function>', '', text)
+    # Remove <function_calls>...</function_calls> XML blocks (Claude-style)
+    text = re.sub(r'<function_calls>.*?</function_calls>', '', text, flags=re.DOTALL)
+    return text.strip()
+
+
 def _parse_text_tool_calls(text: str):
     """Fallback parser for models (Groq/Llama, etc.) that emit tool calls as
     <function>name{"arg": val}</function> text instead of structured tool_calls.
     Returns (cleaned_text, calls_list) in the same format as adapter.chat()."""
-    # Match <function>toolname{...}</function>  (args may span multiple lines)
-    pattern = re.compile(r'<function>(\w+)(\{[^<]*?\})?</function>', re.DOTALL)
+    # Greedy match on args: \{.*?\} with DOTALL so newlines work,
+    # using non-greedy .*? bounded by the outer </function> sentinel.
+    # Two patterns: with JSON args and bare (no args).
+    pattern = re.compile(
+        r'<function>(\w+)(\{.*?\})?</function>', re.DOTALL)
     calls = []
+    ts = datetime.now().strftime('%H:%M:%S')
     for i, m in enumerate(pattern.finditer(text)):
         name     = m.group(1)
         args_str = (m.group(2) or '{}').strip()
-        # Normalise: sometimes the model writes the arg value without quotes
+        # Validate tool name is known
+        known = {t["name"] for t in TOOL_REGISTRY}
+        if name not in known:
+            print(f"  [{ts}] [TextParser] Skipping unknown tool: {name!r}")
+            continue
         try:
             args = json.loads(args_str)
         except Exception:
+            # Try to salvage by extracting key:value pairs manually
             args = {}
+            for kv in re.finditer(r'"(\w+)"\s*:\s*"([^"]*)"', args_str):
+                args[kv.group(1)] = kv.group(2)
+            for kv in re.finditer(r'"(\w+)"\s*:\s*(\d+)', args_str):
+                args[kv.group(1)] = int(kv.group(2))
         fake_id = f"txt_{i}_{name}"
+        print(f"  [{ts}] [TextParser] Parsed tool call: {name}({args})")
         calls.append({
             "id":   fake_id,
             "name": name,
             "args": args,
-            # Synthetic raw that matches the OpenAI tool_calls format so that
-            # chat_with_results() can feed results back properly
             "raw":  {"id": fake_id, "type": "function",
                      "function": {"name": name,
                                   "arguments": json.dumps(args)}}
         })
     cleaned = pattern.sub('', text).strip()
+    if calls:
+        print(f"  [{ts}] [TextParser] Found {len(calls)} text tool call(s) — executing")
+    else:
+        print(f"  [{ts}] [TextParser] <function> in text but no valid calls parsed")
+        print(f"  [{ts}] [TextParser] Raw text snippet: {text[:200]!r}")
     return cleaned, calls
 
 
@@ -820,6 +850,7 @@ def process_chat_agentic(user_message: str):
     # Fallback: some models (Groq/Llama) emit <function>name{...}</function>
     # as text instead of structured tool_calls. Detect and route them.
     if not tool_calls and text and '<function>' in text:
+        print(f"  [{datetime.now().strftime('%H:%M:%S')}] [TextParser] Triggered for provider={config.get('llm',{}).get('provider','?')}")
         cleaned, tool_calls = _parse_text_tool_calls(text)
         if tool_calls:
             text    = cleaned or None
@@ -830,10 +861,11 @@ def process_chat_agentic(user_message: str):
             # For anthropic/gemini text-parsed calls are uncommon; best-effort
             # by re-using whatever asst_raw came back (no tool content blocks)
     if not tool_calls:
-        # Pure text response
-        _record_chat(user_message, text or "")
+        # Pure text response — strip any stray function tags before storing
+        reply = _strip_function_tags(text or "")
+        _record_chat(user_message, reply)
         with chat_lock: hist = list(chat_history)
-        return {"type": "reply", "reply": text or "", "history": hist}
+        return {"type": "reply", "reply": reply, "history": hist}
     # Has tool calls
     expanded = expand_tool_calls(tool_calls)
     is_multi = len(expanded) > 1
@@ -844,6 +876,7 @@ def process_chat_agentic(user_message: str):
         final, exec_log = _execute_pending({
             "expanded": expanded, "tool_calls": tool_calls, "asst_raw": asst_raw,
             "msg_payload": msg_payload, "system": system})
+        final = _strip_function_tags(final)
         _record_chat(user_message, final)
         with chat_lock: hist = list(chat_history)
         return {"type": "reply", "reply": final, "history": hist, "exec_log": exec_log}
@@ -879,6 +912,7 @@ def confirm_pending(action_id: str, confirmed: bool, trust_hours: int = 0):
     if trust_hours and trust_hours > 0:
         activate_trust(trust_hours)
     final, exec_log = _execute_pending(pending)
+    final = _strip_function_tags(final)
     _record_chat(pending["user_message"], final)
     with chat_lock: hist = list(chat_history)
     return {"type": "reply", "reply": final, "history": hist, "exec_log": exec_log}
