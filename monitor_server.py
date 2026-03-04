@@ -21,15 +21,22 @@ import sys, os, json, time, smtplib, threading, subprocess
 import urllib.request, urllib.error, urllib.parse
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer as _HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+
+class HTTPServer(ThreadingMixIn, _HTTPServer):
+    """Thread-per-request so LLM calls never block the UI poll loop."""
+    daemon_threads = True
 from datetime import datetime
 
-ADD_PRINTER_MODE = (len(sys.argv) > 1 and sys.argv[1] == "add-printer")
+ADD_PRINTER_MODE    = (len(sys.argv) > 1 and sys.argv[1] == "add-printer")
+CONFIGURE_LLM_MODE  = (len(sys.argv) > 1 and sys.argv[1] == "configure-llm")
 PORT = 8484
 for _arg in sys.argv[1:]:
     if _arg.isdigit(): PORT = int(_arg)
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor_config.json")
+CONFIG_FILE       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor_config.json")
+CHAT_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_history.json")
 
 DEFAULT_CONFIG = {
     "printers": [
@@ -43,7 +50,17 @@ DEFAULT_CONFIG = {
                  "from_number": "", "to_number": ""},
     "email":    {"enabled": False, "smtp_host": "smtp.gmail.com", "smtp_port": 587,
                  "username": "", "password": "", "from_address": "", "to_address": ""},
-    "imessage": {"enabled": False, "to_number": ""}
+    "imessage": {"enabled": False, "to_number": ""},
+    "llm": {
+        "enabled": False,
+        "provider": "anthropic",
+        "history_enabled": True,
+        "history_max_messages": 100,
+        "anthropic": {"api_key": "", "model": "claude-haiku-4-5-20251001"},
+        "openai":    {"api_key": "", "model": "gpt-4o-mini",
+                      "base_url": "https://api.openai.com/v1"},
+        "ollama":    {"base_url": "http://localhost:11434", "model": "llama3.2"}
+    }
 }
 
 config        = {}
@@ -51,6 +68,232 @@ alert_log     = []
 global_lock   = threading.Lock()
 printer_states = {}
 poll_threads   = {}
+chat_history  = []           # in-memory; optionally persisted to chat_history.json
+chat_lock     = threading.Lock()
+
+# ── LLM adapter layer ─────────────────────────────────────────────────────────
+# To swap providers, change config["llm"]["provider"].
+# Each adapter speaks only stdlib urllib — zero extra dependencies.
+
+class LLMAdapter:
+    """Abstract base — subclasses implement chat()."""
+    def chat(self, messages: list, system: str) -> str:
+        raise NotImplementedError
+
+class AnthropicAdapter(LLMAdapter):
+    def __init__(self, api_key: str, model: str = "claude-haiku-4-5-20251001"):
+        self.api_key = api_key
+        self.model   = model
+
+    def chat(self, messages: list, system: str) -> str:
+        payload = json.dumps({
+            "model":      self.model,
+            "max_tokens": 2048,
+            "system":     system,
+            "messages":   messages,
+        }).encode()
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "x-api-key":         self.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+        return data["content"][0]["text"]
+
+class OpenAIAdapter(LLMAdapter):
+    """Works with OpenAI, Groq, Mistral, LM Studio, Together, and any
+    OpenAI-compatible endpoint."""
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini",
+                 base_url: str = "https://api.openai.com/v1"):
+        self.api_key  = api_key
+        self.model    = model
+        self.base_url = base_url.rstrip("/")
+
+    def chat(self, messages: list, system: str) -> str:
+        full_messages = [{"role": "system", "content": system}] + messages
+        payload = json.dumps({
+            "model":      self.model,
+            "messages":   full_messages,
+            "max_tokens": 2048,
+        }).encode()
+        req = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type":  "application/json",
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+        return data["choices"][0]["message"]["content"]
+
+class OllamaAdapter(LLMAdapter):
+    """Talks to a local Ollama instance — no API key needed."""
+    def __init__(self, base_url: str = "http://localhost:11434",
+                 model: str = "llama3.2"):
+        self.base_url = base_url.rstrip("/")
+        self.model    = model
+
+    def chat(self, messages: list, system: str) -> str:
+        full_messages = [{"role": "system", "content": system}] + messages
+        payload = json.dumps({
+            "model":    self.model,
+            "messages": full_messages,
+            "stream":   False,
+        }).encode()
+        req = urllib.request.Request(
+            f"{self.base_url}/api/chat",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read())
+        return data["message"]["content"]
+
+def get_llm_adapter() -> LLMAdapter:
+    """Instantiate the active LLM adapter from config. Raises ValueError if misconfigured."""
+    llm  = config.get("llm", {})
+    prov = llm.get("provider", "anthropic")
+    if prov == "anthropic":
+        key   = llm.get("anthropic", {}).get("api_key", "").strip()
+        model = llm.get("anthropic", {}).get("model", "claude-haiku-4-5-20251001")
+        if not key: raise ValueError("Anthropic API key not configured.")
+        return AnthropicAdapter(key, model)
+    elif prov == "openai":
+        key   = llm.get("openai", {}).get("api_key", "").strip()
+        model = llm.get("openai", {}).get("model", "gpt-4o-mini")
+        base  = llm.get("openai", {}).get("base_url", "https://api.openai.com/v1")
+        if not key: raise ValueError("OpenAI API key not configured.")
+        return OpenAIAdapter(key, model, base)
+    elif prov == "ollama":
+        base  = llm.get("ollama", {}).get("base_url", "http://localhost:11434")
+        model = llm.get("ollama", {}).get("model", "llama3.2")
+        return OllamaAdapter(base, model)
+    else:
+        raise ValueError(f"Unknown LLM provider: {prov!r}")
+
+def build_system_prompt() -> str:
+    """Inject live fleet state into the system prompt so the LLM always has context."""
+    lines = [
+        "You are Fleet AI, an intelligent assistant embedded in a 3D printer monitoring dashboard.",
+        f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        "## Live Fleet Status",
+    ]
+    for p in config.get("printers", []):
+        if not p.get("enabled", True):
+            continue
+        pid = p["id"]
+        st  = printer_states.get(pid, {})
+        lk  = st.get("lock", threading.Lock())
+        with lk:
+            s       = dict(st.get("last_status", {}))
+            aalerts = list(st.get("active_alerts", []))
+            lp      = st.get("last_poll")
+        ps  = s.get("print_stats",    {})
+        ext = s.get("extruder",       {})
+        bed = s.get("heater_bed",     {})
+        vsd = s.get("virtual_sdcard", {})
+        state = ps.get("state", "unknown")
+        prog  = vsd.get("progress", 0) * 100
+        el    = ps.get("print_duration", 0)
+        tot   = ps.get("total_duration", 0)
+        eta   = max(tot - el, 0)
+        def _t(sec):
+            h = int(sec)//3600; m = (int(sec)%3600)//60
+            return f"{h}h {m}m"
+        lines.append(f"\n**{p.get('name', pid)}** ({p.get('host','')})")
+        lines.append(f"  State: {state.upper()}  |  Progress: {prog:.1f}%")
+        if ps.get("filename"):
+            lines.append(f"  File: {ps['filename']}")
+        lines.append(f"  Hotend: {ext.get('temperature',0):.1f}C / {ext.get('target',0)}C  "
+                     f"|  Bed: {bed.get('temperature',0):.1f}C / {bed.get('target',0)}C")
+        if state == "printing":
+            lines.append(f"  Elapsed: {_t(el)}  |  ETA: {_t(eta)}")
+        lines.append("  Active alerts: " + (
+            " | ".join(a["msg"] for a in aalerts) if aalerts else "None"))
+        if lp:
+            lines.append(f"  Last polled: {lp}")
+
+    with global_lock:
+        recent = list(alert_log[:10])
+    if recent:
+        lines.append("\n## Recent Alert Log (last 10)")
+        for e in recent:
+            t = e.get("time","")[:16]
+            lines.append(f"  [{t}] [{e.get('printer','')}] {e.get('level','').upper()}: {e.get('msg','')}")
+
+    lines.append(f"\n## Monitor Config")
+    lines.append(f"  Poll interval: {config.get('poll_interval_seconds',1800)//60} min")
+    enabled_ch = [k for k in ("ntfy","twilio","email","imessage")
+                  if config.get(k,{}).get("enabled")]
+    lines.append(f"  Alert channels: {', '.join(enabled_ch) or 'none enabled'}")
+    lines.append("")
+    lines.append("Be concise and technically precise. Reference specific values when relevant.")
+    lines.append("You can help with: print status, troubleshooting, alert interpretation, "
+                 "Klipper/Moonraker config advice, scheduling, and 3D printing tips.")
+    return "\n".join(lines)
+
+def load_chat_history():
+    global chat_history
+    if not os.path.exists(CHAT_HISTORY_FILE):
+        return
+    try:
+        with open(CHAT_HISTORY_FILE) as f:
+            data = json.load(f)
+        with chat_lock:
+            chat_history = data.get("messages", [])
+        print(f"  Loaded {len(chat_history)} chat history messages.")
+    except Exception as e:
+        print(f"  Warning: could not load chat history: {e}")
+
+def save_chat_history():
+    llm = config.get("llm", {})
+    if not llm.get("history_enabled", True):
+        return
+    max_msgs = llm.get("history_max_messages", 100)
+    with chat_lock:
+        msgs = list(chat_history[-max_msgs:])
+    try:
+        with open(CHAT_HISTORY_FILE, "w") as f:
+            json.dump({"messages": msgs}, f, indent=2)
+    except Exception as e:
+        print(f"  Warning: could not save chat history: {e}")
+
+def process_chat_message(user_message: str):
+    """Send a user message through the active LLM adapter.
+    Returns (reply_str, updated_history_list)."""
+    llm_cfg = config.get("llm", {})
+    if not llm_cfg.get("enabled", False):
+        raise ValueError("LLM chat is not enabled. Open \u2699 settings to configure.")
+    adapter = get_llm_adapter()
+    system  = build_system_prompt()
+    with chat_lock:
+        # Only send role/content to the LLM — strip internal metadata
+        msg_payload = [{"role": m["role"], "content": m["content"]}
+                       for m in chat_history]
+    msg_payload.append({"role": "user", "content": user_message})
+    reply = adapter.chat(msg_payload, system)
+    now   = datetime.now().isoformat()
+    with chat_lock:
+        chat_history.append({"role": "user",      "content": user_message, "time": now})
+        chat_history.append({"role": "assistant", "content": reply,
+                             "time": datetime.now().isoformat()})
+        max_msgs = llm_cfg.get("history_max_messages", 100)
+        while len(chat_history) > max_msgs:
+            chat_history.pop(0)
+        history_copy = list(chat_history)
+    save_chat_history()
+    return reply, history_copy
 
 def _make_printer_state():
     return {"last_status": {}, "active_alerts": [], "fired_alerts": set(),
@@ -542,6 +785,65 @@ body.fleet-mode .container{max-width:1120px}
 .fc-cam-badge{position:absolute;top:5px;left:6px;background:rgba(0,0,0,.75);color:#60a5fa;font-size:9px;font-weight:700;padding:2px 5px;border-radius:3px;letter-spacing:.05em}
 .section-label{font-size:10px;color:#334155;text-transform:uppercase;letter-spacing:.08em}
 .footer{text-align:center;font-size:10px;color:#1e293b;padding-top:4px}
+/* ── Chat bubble & panel ── */
+.chat-bubble{position:fixed;bottom:22px;right:22px;z-index:9000}
+.chat-fab{width:52px;height:52px;border-radius:50%;background:#1d4ed8;border:2px solid #2563eb;color:#fff;font-size:22px;cursor:pointer;box-shadow:0 4px 18px rgba(0,0,0,.6);transition:transform .15s,background .15s;display:flex;align-items:center;justify-content:center}
+.chat-fab:hover{transform:scale(1.08);background:#2563eb}
+.chat-fab-dot{position:absolute;top:2px;right:2px;width:11px;height:11px;border-radius:50%;background:#ef4444;border:2px solid #0a0a0f;display:none;animation:glow 2s infinite}
+.chat-panel{position:fixed;bottom:86px;right:22px;width:370px;height:530px;background:#0f172a;border:1px solid #1e293b;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.8);display:flex;flex-direction:column;overflow:hidden;z-index:8999;animation:chat-in .18s ease}
+@media(max-width:440px){.chat-panel{width:calc(100vw - 16px);right:8px}}
+@keyframes chat-in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.chat-header{background:#080c14;border-bottom:1px solid #1e293b;padding:11px 14px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.chat-header-title{font-size:13px;font-weight:700;color:#f8fafc;display:flex;align-items:center;gap:7px}
+.chat-header-actions{display:flex;gap:2px}
+.chat-icon-btn{background:none;border:none;color:#475569;cursor:pointer;font-size:15px;padding:4px 6px;border-radius:4px;transition:color .15s,background .15s}
+.chat-icon-btn:hover{color:#94a3b8;background:#1e293b}
+.chat-messages{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:9px;scroll-behavior:smooth}
+.chat-messages::-webkit-scrollbar{width:3px}
+.chat-messages::-webkit-scrollbar-thumb{background:#1e293b;border-radius:2px}
+.msg{max-width:90%;display:flex;flex-direction:column;gap:2px}
+.msg-user{align-self:flex-end;align-items:flex-end}
+.msg-ai{align-self:flex-start;align-items:flex-start}
+.msg-bubble{padding:8px 12px;border-radius:10px;font-size:12px;line-height:1.55;word-break:break-word;white-space:pre-wrap}
+.msg-user .msg-bubble{background:#1d4ed8;color:#dbeafe;border-bottom-right-radius:3px}
+.msg-ai .msg-bubble{background:#1e293b;color:#e2e8f0;border-bottom-left-radius:3px}
+.msg-time{font-size:9px;color:#334155}
+.chat-typing{display:flex;align-items:center;gap:5px;padding:9px 12px;background:#1e293b;border-radius:10px;border-bottom-left-radius:3px;align-self:flex-start}
+.chat-typing span{width:5px;height:5px;border-radius:50%;background:#475569;animation:typing-dot 1.2s infinite}
+.chat-typing span:nth-child(2){animation-delay:.2s}
+.chat-typing span:nth-child(3){animation-delay:.4s}
+@keyframes typing-dot{0%,60%,100%{transform:translateY(0);opacity:.4}30%{transform:translateY(-5px);opacity:1}}
+.chat-input-row{padding:10px 12px;border-top:1px solid #1e293b;display:flex;gap:8px;flex-shrink:0;background:#080c14;align-items:flex-end}
+.chat-input{flex:1;background:#1e293b;border:1px solid #334155;color:#e2e8f0;font-family:inherit;font-size:12px;padding:8px 10px;border-radius:6px;outline:none;resize:none;max-height:80px;line-height:1.45;overflow-y:auto}
+.chat-input:focus{border-color:#3b82f6}
+.chat-input::placeholder{color:#334155}
+.chat-send{background:#1d4ed8;border:none;color:#fff;font-family:inherit;font-size:12px;padding:8px 13px;border-radius:6px;cursor:pointer;transition:background .15s;flex-shrink:0;margin-bottom:1px}
+.chat-send:hover:not(:disabled){background:#2563eb}
+.chat-send:disabled{opacity:.35;cursor:default}
+.chat-empty{color:#334155;font-size:11px;text-align:center;padding:28px 10px;line-height:2.2}
+/* ── Chat settings drawer ── */
+.chat-settings{position:absolute;inset:0;background:#0f172a;z-index:10;display:flex;flex-direction:column;animation:chat-in .15s ease}
+.cs-header{background:#080c14;border-bottom:1px solid #1e293b;padding:11px 14px;display:flex;align-items:center;gap:8px;flex-shrink:0}
+.cs-title{font-size:13px;font-weight:700;color:#f8fafc;flex:1}
+.cs-body{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:14px}
+.cs-group{display:flex;flex-direction:column;gap:7px}
+.cs-lbl{font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:.07em}
+.cs-select,.cs-input{width:100%;background:#080c14;border:1px solid #334155;color:#e2e8f0;font-family:inherit;font-size:12px;padding:7px 9px;border-radius:5px;outline:none}
+.cs-select:focus,.cs-input:focus{border-color:#3b82f6}
+.cs-select option{background:#080c14}
+.cs-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.cs-row-lbl{font-size:12px;color:#94a3b8}
+.cs-footer{padding:11px 14px;border-top:1px solid #1e293b;display:flex;gap:8px;flex-shrink:0;background:#080c14}
+.cs-btn{flex:1;background:#1e293b;border:1px solid #334155;color:#94a3b8;font-family:inherit;font-size:12px;padding:8px;border-radius:5px;cursor:pointer;transition:all .15s}
+.cs-btn:hover{background:#263347;color:#e2e8f0}
+.cs-btn-primary{background:#1d4ed8;border-color:#2563eb;color:#fff}
+.cs-btn-primary:hover{background:#2563eb}
+.cs-btn-danger{border-color:#7f1d1d;color:#ef4444}
+.cs-btn-danger:hover{background:#1a0808}
+.cs-status{font-size:10px;min-height:13px;text-align:center;padding:2px 0}
+.cs-provider-badge{display:inline-block;padding:1px 7px;border-radius:8px;font-size:9px;font-weight:700}
+.cs-badge-on{background:#0f2a1a;border:1px solid #22c55e;color:#4ade80}
+.cs-badge-off{background:#1a1a2e;border:1px solid #334155;color:#475569}
 </style>
 </head>
 <body><div class="container">
@@ -682,6 +984,95 @@ body.fleet-mode .container{max-width:1120px}
   Server polls every <span id="intervalLabel">30 min</span> &mdash; alerts fire even when this tab is closed<br>
   Edit <strong>monitor_config.json</strong> to enable channels &middot; proxy: localhost:__PORT__
 </div>
+<!-- ═══ CHAT BUBBLE (fixed, outside container) ═══ -->
+<div class="chat-bubble">
+  <button class="chat-fab" id="chatFab" onclick="toggleChat()" title="Fleet AI Assistant">
+    <span id="chatFabIcon">&#128172;</span>
+    <span class="chat-fab-dot" id="chatFabDot"></span>
+  </button>
+  <div class="chat-panel" id="chatPanel" style="display:none">
+    <!-- Header -->
+    <div class="chat-header">
+      <div class="chat-header-title">
+        &#129302; Fleet AI
+        <span class="cs-provider-badge cs-badge-off" id="chatProvBadge">off</span>
+      </div>
+      <div class="chat-header-actions">
+        <button class="chat-icon-btn" onclick="openChatSettings()" title="LLM Settings">&#9881;</button>
+        <button class="chat-icon-btn" onclick="toggleChat()" title="Close">&#10005;</button>
+      </div>
+    </div>
+    <!-- Messages -->
+    <div class="chat-messages" id="chatMessages">
+      <div class="chat-empty" id="chatEmpty">
+        Ask me about your fleet,<br>alerts, or 3D printing tips.<br>
+        <span style="color:#1e293b">Open &#9881; to configure your LLM.</span>
+      </div>
+    </div>
+    <!-- Input -->
+    <div class="chat-input-row">
+      <textarea class="chat-input" id="chatInput" rows="1"
+        placeholder="Ask about your fleet&#8230;"
+        onkeydown="chatKeydown(event)" oninput="chatAutoResize(this)"></textarea>
+      <button class="chat-send" id="chatSend" onclick="sendChat()" disabled>Send</button>
+    </div>
+    <!-- Settings drawer (overlaid) -->
+    <div class="chat-settings" id="chatSettings" style="display:none">
+      <div class="cs-header">
+        <button class="chat-icon-btn" onclick="closeChatSettings()">&#8592;</button>
+        <span class="cs-title">&#9881; LLM Settings</span>
+      </div>
+      <div class="cs-body">
+        <div class="cs-group">
+          <div class="cs-lbl">Chat Assistant</div>
+          <div class="cs-row">
+            <span class="cs-row-lbl">Enable Fleet AI</span>
+            <label class="toggle" style="margin:0">
+              <input type="checkbox" id="csEnabled">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </div>
+        <div class="cs-group">
+          <div class="cs-lbl">Provider</div>
+          <select class="cs-select" id="csProvider" onchange="csProviderChange()">
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="openai">OpenAI-compatible (Groq, Mistral, LM Studio&hellip;)</option>
+            <option value="ollama">Ollama (local / offline)</option>
+          </select>
+        </div>
+        <div class="cs-group" id="csApiKeyGroup">
+          <div class="cs-lbl">API Key</div>
+          <input class="cs-input" id="csApiKey" type="password" placeholder="sk-&#8230;"/>
+        </div>
+        <div class="cs-group" id="csBaseUrlGroup" style="display:none">
+          <div class="cs-lbl">Base URL</div>
+          <input class="cs-input" id="csBaseUrl" placeholder="http://localhost:11434"/>
+        </div>
+        <div class="cs-group">
+          <div class="cs-lbl">Model</div>
+          <input class="cs-input" id="csModel" placeholder="claude-haiku-4-5-20251001"/>
+        </div>
+        <div class="cs-group">
+          <div class="cs-lbl">History</div>
+          <div class="cs-row">
+            <span class="cs-row-lbl">Persist across restarts</span>
+            <label class="toggle" style="margin:0">
+              <input type="checkbox" id="csHistoryEnabled">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </div>
+        <div class="cs-status" id="csStatus"></div>
+      </div>
+      <div class="cs-footer">
+        <button class="cs-btn cs-btn-danger" onclick="clearChatHistory()">Clear History</button>
+        <button class="cs-btn cs-btn-primary" onclick="saveChatSettings()">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 </div>
 
 <script>
@@ -1041,6 +1432,7 @@ async function refreshUI(){
     renderChannels(cfg);
     renderAlertLog(ad.alert_log);
     if(managePanelOpen)renderManagePanel();
+    updateChatFabDot();
     var ap=allPrinters.find(function(p){return p.id===activePrinterId;})||allPrinters[0];
     if(viewMode==='fleet'){
       document.getElementById('fleetView').style.display='block';
@@ -1067,6 +1459,225 @@ async function refreshUI(){
   }catch(e){
     document.getElementById('alertsContainer').innerHTML='<div class="alert alert-critical">Monitor server unreachable: '+e.message+'</div>';
   }finally{document.getElementById('spinner').style.display='none';}
+}
+
+/* ═══════════════════════════════════════════════════════
+   FLEET AI CHAT
+═══════════════════════════════════════════════════════ */
+var chatOpen=false, chatHistory=[], chatLoaded=false;
+
+function toggleChat(){
+  chatOpen=!chatOpen;
+  document.getElementById('chatPanel').style.display=chatOpen?'flex':'none';
+  document.getElementById('chatFabIcon').textContent=chatOpen?'\u2715':'\u{1F4AC}';
+  if(chatOpen&&!chatLoaded){loadChatHistory();}
+  if(chatOpen)updateChatProvBadge();
+}
+
+function loadChatHistory(){
+  fetch('/api/chat/history').then(function(r){return r.json();}).then(function(d){
+    chatHistory=d.history||[];
+    chatLoaded=true;
+    renderChatMessages();
+  }).catch(function(){});
+}
+
+function updateChatProvBadge(){
+  fetch('/api/config').then(function(r){return r.json();}).then(function(cfg){
+    var llm=cfg.llm||{};
+    var on=!!llm.enabled;
+    var prov=llm.provider||'anthropic';
+    var labels={'anthropic':'Claude','openai':'OpenAI','ollama':'Ollama'};
+    var badge=document.getElementById('chatProvBadge');
+    if(badge){
+      badge.textContent=on?(labels[prov]||prov):'off';
+      badge.className='cs-provider-badge '+(on?'cs-badge-on':'cs-badge-off');
+    }
+    document.getElementById('chatSend').disabled=!on;
+    var empty=document.getElementById('chatEmpty');
+    if(empty&&!chatHistory.length){
+      if(on)empty.innerHTML='Ask me about your fleet,<br>alerts, or 3D printing tips.';
+      else empty.innerHTML='Open \u2699 to configure your LLM provider.';
+    }
+  }).catch(function(){});
+}
+
+function renderChatMessages(){
+  var box=document.getElementById('chatMessages');
+  var empty=document.getElementById('chatEmpty');
+  // Remove previous message bubbles
+  box.querySelectorAll('.msg').forEach(function(el){el.remove();});
+  if(!chatHistory.length){if(empty)empty.style.display='block';return;}
+  if(empty)empty.style.display='none';
+  chatHistory.forEach(function(m){
+    var div=document.createElement('div');
+    div.className='msg '+(m.role==='user'?'msg-user':'msg-ai');
+    var t=m.time?new Date(m.time).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'';
+    div.innerHTML='<div class="msg-bubble">'+escChatMsg(m.content)+'</div>'
+      +'<div class="msg-time">'+t+'</div>';
+    box.appendChild(div);
+  });
+  box.scrollTop=box.scrollHeight;
+}
+
+/* Escape HTML but preserve newlines as <br> for readability */
+function escChatMsg(s){
+  return String(s||'')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+
+function chatAutoResize(el){
+  el.style.height='auto';
+  el.style.height=Math.min(el.scrollHeight,80)+'px';
+}
+
+function chatKeydown(e){
+  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat();}
+}
+
+async function sendChat(){
+  var inp=document.getElementById('chatInput');
+  var msg=inp.value.trim();
+  if(!msg)return;
+  inp.value='';inp.style.height='auto';
+  // Optimistic: add user message
+  var now=new Date().toISOString();
+  chatHistory.push({role:'user',content:msg,time:now});
+  renderChatMessages();
+  // Typing indicator
+  var box=document.getElementById('chatMessages');
+  var typing=document.createElement('div');
+  typing.className='chat-typing';typing.id='chatTyping';
+  typing.innerHTML='<span></span><span></span><span></span>';
+  box.appendChild(typing);box.scrollTop=box.scrollHeight;
+  document.getElementById('chatSend').disabled=true;
+  try{
+    var r=await fetch('/api/chat',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message:msg})});
+    if(typing.parentNode)typing.remove();
+    var d=await r.json();
+    if(r.ok){
+      chatHistory=d.history||chatHistory;
+      renderChatMessages();
+    }else{
+      chatHistory.push({role:'assistant',
+        content:'\u26a0\ufe0f Error: '+(d.error||'Unknown error'),
+        time:new Date().toISOString()});
+      renderChatMessages();
+    }
+  }catch(err){
+    if(document.getElementById('chatTyping'))document.getElementById('chatTyping').remove();
+    chatHistory.push({role:'assistant',
+      content:'\u26a0\ufe0f Could not reach server: '+err.message,
+      time:new Date().toISOString()});
+    renderChatMessages();
+  }finally{
+    updateChatProvBadge();
+  }
+}
+
+/* ── Settings drawer ── */
+function openChatSettings(){
+  document.getElementById('chatSettings').style.display='flex';
+  fetch('/api/config').then(function(r){return r.json();}).then(function(cfg){
+    var llm=cfg.llm||{};
+    var prov=llm.provider||'anthropic';
+    document.getElementById('csEnabled').checked=!!llm.enabled;
+    document.getElementById('csProvider').value=prov;
+    document.getElementById('csHistoryEnabled').checked=llm.history_enabled!==false;
+    if(prov==='anthropic'){
+      document.getElementById('csApiKey').value=
+        (llm.anthropic&&llm.anthropic.api_key)?'\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7':'';
+      document.getElementById('csModel').value=
+        (llm.anthropic&&llm.anthropic.model)||'claude-haiku-4-5-20251001';
+    }else if(prov==='openai'){
+      document.getElementById('csApiKey').value=
+        (llm.openai&&llm.openai.api_key)?'\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7':'';
+      document.getElementById('csBaseUrl').value=
+        (llm.openai&&llm.openai.base_url)||'https://api.openai.com/v1';
+      document.getElementById('csModel').value=
+        (llm.openai&&llm.openai.model)||'gpt-4o-mini';
+    }else if(prov==='ollama'){
+      document.getElementById('csBaseUrl').value=
+        (llm.ollama&&llm.ollama.base_url)||'http://localhost:11434';
+      document.getElementById('csModel').value=
+        (llm.ollama&&llm.ollama.model)||'llama3.2';
+    }
+    csProviderChange();
+  });
+}
+
+function closeChatSettings(){
+  document.getElementById('chatSettings').style.display='none';
+  document.getElementById('csStatus').textContent='';
+}
+
+function csProviderChange(){
+  var prov=document.getElementById('csProvider').value;
+  document.getElementById('csApiKeyGroup').style.display=
+    prov==='ollama'?'none':'block';
+  document.getElementById('csBaseUrlGroup').style.display=
+    prov!=='anthropic'?'block':'none';
+  var ph={'anthropic':'claude-haiku-4-5-20251001','openai':'gpt-4o-mini','ollama':'llama3.2'};
+  document.getElementById('csModel').placeholder=ph[prov]||'model-name';
+}
+
+async function saveChatSettings(){
+  var prov=document.getElementById('csProvider').value;
+  var enabled=document.getElementById('csEnabled').checked;
+  var model=document.getElementById('csModel').value.trim();
+  var histOn=document.getElementById('csHistoryEnabled').checked;
+  var apiKey=document.getElementById('csApiKey').value.trim();
+  var baseUrl=document.getElementById('csBaseUrl').value.trim();
+  var status=document.getElementById('csStatus');
+  status.textContent='Saving\u2026';status.style.color='#475569';
+  var payload={llm:{enabled:enabled,provider:prov,history_enabled:histOn}};
+  if(prov==='anthropic'){
+    payload.llm.anthropic={model:model||'claude-haiku-4-5-20251001'};
+    if(apiKey&&apiKey!=='\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7')
+      payload.llm.anthropic.api_key=apiKey;
+  }else if(prov==='openai'){
+    payload.llm.openai={model:model||'gpt-4o-mini',
+      base_url:baseUrl||'https://api.openai.com/v1'};
+    if(apiKey&&apiKey!=='\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7')
+      payload.llm.openai.api_key=apiKey;
+  }else if(prov==='ollama'){
+    payload.llm.ollama={model:model||'llama3.2',
+      base_url:baseUrl||'http://localhost:11434'};
+  }
+  try{
+    var r=await fetch('/api/settings',{method:'PATCH',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload)});
+    var d=await r.json();
+    if(r.ok){
+      status.textContent='\u2705 Saved!';status.style.color='#4ade80';
+      updateChatProvBadge();
+      setTimeout(function(){status.textContent='';},2500);
+    }else{status.textContent=d.error||'Error.';status.style.color='#ef4444';}
+  }catch(e){status.textContent='Failed: '+e.message;status.style.color='#ef4444';}
+}
+
+async function clearChatHistory(){
+  if(!confirm('Clear all chat history?'))return;
+  try{
+    await fetch('/api/chat/clear',{method:'POST'});
+    chatHistory=[];renderChatMessages();
+    document.getElementById('csStatus').textContent='\u2705 History cleared.';
+    document.getElementById('csStatus').style.color='#4ade80';
+    setTimeout(function(){document.getElementById('csStatus').textContent='';},2500);
+  }catch(e){}
+}
+
+/* ── FAB alert dot: red when any printer has active critical alert ── */
+function updateChatFabDot(){
+  var hasCrit=allPrinters.some(function(p){
+    return(p.active_alerts||[]).some(function(a){return a.level==='critical';});
+  });
+  var dot=document.getElementById('chatFabDot');
+  if(dot)dot.style.display=hasCrit?'block':'none';
 }
 
 if('Notification'in window&&Notification.permission==='default')Notification.requestPermission();
@@ -1148,6 +1759,11 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json(502, {"error": f"Camera unavailable: {e}"})
 
+        elif path == "/api/chat/history":
+            with chat_lock:
+                history_copy = list(chat_history)
+            self.send_json(200, {"history": history_copy})
+
         elif path == "/api/alerts":
             with global_lock: lg = list(alert_log)
             self.send_json(200, {"alert_log": lg})
@@ -1157,6 +1773,9 @@ class Handler(BaseHTTPRequestHandler):
             for ch in ("twilio","email"):
                 for k in ("auth_token","password"):
                     if safe.get(ch,{}).get(k): safe[ch][k] = "••••••••"
+            for _prov in ("anthropic","openai"):
+                if safe.get("llm",{}).get(_prov,{}).get("api_key"):
+                    safe["llm"][_prov]["api_key"] = "••••••••"
             self.send_json(200, safe)
 
         elif path == "/api/status":  # backward compat — returns first printer status
@@ -1209,6 +1828,32 @@ class Handler(BaseHTTPRequestHandler):
                 daemon=True).start()
             self.send_json(200, {"ok": True})
 
+        elif path == "/api/chat":
+            body = self._read_body()
+            msg  = body.get("message","").strip()
+            if not msg:
+                self.send_json(400, {"error": "message is required"}); return
+            try:
+                reply, history = process_chat_message(msg)
+                self.send_json(200, {"reply": reply, "history": history})
+            except ValueError as e:
+                self.send_json(400, {"error": str(e)})
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode(errors="ignore")
+                self.send_json(502, {"error": f"LLM API error {e.code}: {err_body[:300]}"})
+            except Exception as e:
+                self.send_json(500, {"error": f"LLM error: {e}"})
+
+        elif path == "/api/chat/clear":
+            with chat_lock:
+                chat_history.clear()
+            try:
+                if os.path.exists(CHAT_HISTORY_FILE):
+                    os.remove(CHAT_HISTORY_FILE)
+            except Exception:
+                pass
+            self.send_json(200, {"ok": True})
+
         elif path == "/api/printers":  # add printer at runtime
             body = self._read_body()
             name = body.get("name","").strip()
@@ -1233,8 +1878,24 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404); self.end_headers()
 
     def do_PATCH(self):
-        """PATCH /api/printers/<id>  — rename, change host, or toggle enabled."""
+        """PATCH /api/printers/<id>  — rename, change host, or toggle enabled.
+        PATCH /api/settings           — update LLM and other server settings."""
         path = self.path.split("?")[0]
+
+        if path == "/api/settings":
+            body     = self._read_body()
+            if "llm" in body:
+                llm_patch = body["llm"]
+                llm_conf  = config.setdefault("llm", {})
+                for k in ("enabled","provider","history_enabled","history_max_messages"):
+                    if k in llm_patch:
+                        llm_conf[k] = llm_patch[k]
+                for prov in ("anthropic","openai","ollama"):
+                    if prov in llm_patch:
+                        llm_conf.setdefault(prov, {}).update(llm_patch[prov])
+                save_config()
+            self.send_json(200, {"ok": True}); return
+
         if not path.startswith("/api/printers/"):
             self.send_response(404); self.end_headers(); return
 
@@ -1327,14 +1988,71 @@ def cli_add_printer():
     print(f"\n  Printer '{name}' added to {CONFIG_FILE}")
     print("  Restart monitor_server.py to begin monitoring this printer.\n")
 
+def cli_configure_llm():
+    print()
+    print("  +-------------------------------------------------+")
+    print("  |   Configure LLM Chat Assistant                  |")
+    print("  +-------------------------------------------------+")
+    print()
+    load_config()
+    llm  = config.get("llm", {})
+    prov = llm.get("provider","anthropic")
+    print(f"  Current: {'ENABLED' if llm.get('enabled') else 'DISABLED'} | Provider: {prov}")
+    print()
+    ans = input("  Enable LLM chat? [y/N]: ").strip().lower()
+    if ans not in ("y","yes"):
+        config.setdefault("llm",{})["enabled"] = False
+        save_config()
+        print("  LLM chat disabled and saved.")
+        return
+    print("\n  Providers:")
+    print("    1. anthropic  — Anthropic Claude (cloud)")
+    print("    2. openai     — OpenAI-compatible  (Groq, Mistral, LM Studio, Together...)")
+    print("    3. ollama     — Ollama (local, no API key needed)")
+    choice = input("  Select [1/2/3] (default 1): ").strip()
+    prov_map = {"1":"anthropic","2":"openai","3":"ollama",
+                "anthropic":"anthropic","openai":"openai","ollama":"ollama"}
+    prov = prov_map.get(choice, "anthropic")
+    upd  = {"enabled": True, "provider": prov}
+    if prov == "anthropic":
+        key   = input("  Anthropic API key (sk-ant-...): ").strip()
+        model = input("  Model [claude-haiku-4-5-20251001]: ").strip() or "claude-haiku-4-5-20251001"
+        upd["anthropic"] = {"api_key": key, "model": model}
+    elif prov == "openai":
+        base  = input("  Base URL [https://api.openai.com/v1]: ").strip() or "https://api.openai.com/v1"
+        key   = input("  API key: ").strip()
+        model = input("  Model [gpt-4o-mini]: ").strip() or "gpt-4o-mini"
+        upd["openai"] = {"api_key": key, "base_url": base, "model": model}
+    elif prov == "ollama":
+        base  = input("  Ollama URL [http://localhost:11434]: ").strip() or "http://localhost:11434"
+        model = input("  Model [llama3.2]: ").strip() or "llama3.2"
+        upd["ollama"] = {"base_url": base, "model": model}
+    hist = input("\n  Persist chat history across restarts? [Y/n]: ").strip().lower()
+    upd["history_enabled"] = hist not in ("n","no")
+    max_h = input("  Max messages to keep [100]: ").strip()
+    upd["history_max_messages"] = int(max_h) if max_h.isdigit() else 100
+    cfg_llm = config.setdefault("llm",{})
+    for k, v in upd.items():
+        if isinstance(v, dict):
+            cfg_llm.setdefault(k, {}).update(v)
+        else:
+            cfg_llm[k] = v
+    save_config()
+    print(f"\n  LLM configured: {prov} | history: {'on' if upd['history_enabled'] else 'off'}")
+    print("  Restart monitor_server.py to apply.\n")
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     if ADD_PRINTER_MODE:
         cli_add_printer()
         sys.exit(0)
+    if CONFIGURE_LLM_MODE:
+        cli_configure_llm()
+        sys.exit(0)
 
     load_config()
+    load_chat_history()
 
     for printer in config.get("printers", []):
         if printer.get("enabled", True):
@@ -1359,8 +2077,17 @@ if __name__ == "__main__":
     print(f"  {sep}")
     print(f"  Push(ntfy): {icons['ntfy']}  SMS(Twilio): {icons['sms']}  Email: {icons['email']}  iMessage: {icons['imsg']}")
     print(f"  {sep}")
+    llm_cfg = config.get("llm",{})
+    if llm_cfg.get("enabled"):
+        _prov  = llm_cfg.get("provider","anthropic")
+        _model = llm_cfg.get(_prov,{}).get("model","?")
+        _ls    = f"ON  ({_prov} / {_model})"
+    else:
+        _ls    = "OFF  (run: python3 monitor_server.py configure-llm)"
+    print(f"  AI Chat  : {_ls}")
     print(f"  Config   : monitor_config.json")
     print(f"  Add more : python3 monitor_server.py add-printer")
+    print(f"  LLM setup: python3 monitor_server.py configure-llm")
     print(f"  {sep}")
     print(f"\n  Open  http://localhost:{PORT}  in your browser.")
     print(f"  Ctrl+C to stop.\n")
