@@ -375,7 +375,143 @@ Recommended values:
 
 ---
 
-## Usage Examples (Claude Desktop)
+## 🖨️ Multi-Printer Support
+
+Both the MCP server and the monitor support an unlimited number of printers. Each printer is polled on its own background thread; alerts, status, and camera feeds are scoped per printer.
+
+---
+
+### MCP Server — Multiple Printers
+
+Set `PRINTER_HOSTS` as a JSON array (instead of the single-printer `PRINTER_HOST`):
+
+```json
+[
+  {"id": "voron",  "name": "Voron 2.4",  "host": "http://192.168.1.100", "api_token": ""},
+  {"id": "ender",  "name": "Ender 5 Pro","host": "http://192.168.1.101", "api_token": ""},
+  {"id": "bambu",  "name": "Bambu P1S",  "host": "http://192.168.1.102", "api_token": ""}
+]
+```
+
+Via Docker MCP secrets:
+
+```bash
+docker mcp secret set PRINTER_HOSTS='[{"id":"voron","name":"Voron 2.4","host":"http://192.168.1.100"},{"id":"ender","name":"Ender 5 Pro","host":"http://192.168.1.101"}]'
+```
+
+Once set, Claude can target any printer by name or URL in every tool:
+
+```
+"Check the status of the Voron"
+"Pause the Ender"
+"What's the bed temp on printer http://192.168.1.102?"
+"List all my printers"   ← uses list_printers tool
+```
+
+The `list_printers` tool shows all configured printers with their IDs and hosts.
+
+#### Automated setup (adds printers interactively)
+
+```bash
+./setup.sh
+# Step 2 will ask: "Add another printer?" after each one
+```
+
+---
+
+### Monitor Server — Multiple Printers
+
+#### Initial setup — adding printers during `./setup.sh`
+
+Step 2 of `setup.sh` loops until you decline to add another printer. Each printer's name, host, and token is collected and written to both `PRINTER_HOSTS` (Docker MCP) and `monitor_config.json`.
+
+#### Adding a printer after initial setup
+
+**Option A — interactive CLI (recommended):**
+
+```bash
+python3 monitor_server.py add-printer
+# — or via setup.sh shortcut —
+./setup.sh add-printer
+```
+
+You'll be prompted for the printer name and host URL. The entry is written to `monitor_config.json` and a poll thread starts on the next server restart.
+
+**Option B — REST API (while server is running):**
+
+```bash
+curl -X POST http://localhost:8484/api/printers \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Bambu P1S", "host": "http://192.168.1.103", "api_token": ""}'
+```
+
+The printer is registered immediately and starts polling — no restart required.
+
+**Option C — edit `monitor_config.json` directly:**
+
+```json
+{
+  "printers": [
+    {"id": "voron",  "name": "Voron 2.4",  "host": "http://192.168.1.100", "enabled": true, "api_token": ""},
+    {"id": "ender",  "name": "Ender 5 Pro","host": "http://192.168.1.101", "enabled": true, "api_token": ""}
+  ]
+}
+```
+
+Then restart `monitor_server.py`.
+
+#### Renaming or editing a printer
+
+**From the web UI:**
+
+1. Open `http://localhost:8484`
+2. Click **⚙ Manage** next to the printer tabs
+3. Click **✎ Edit** on any printer to rename it, change its host URL, or update the API token
+4. Toggle the enable/disable switch to pause monitoring without removing the printer
+
+**From the CLI (while server is running):**
+
+```bash
+# Rename
+curl -X PATCH http://localhost:8484/api/printers/voron \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Voron 2.4 — Garage"}'
+
+# Change host
+curl -X PATCH http://localhost:8484/api/printers/ender \
+  -H "Content-Type: application/json" \
+  -d '{"host": "http://10.0.0.55"}'
+
+# Disable monitoring (pauses polling without removing)
+curl -X PATCH http://localhost:8484/api/printers/bambu \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": false}'
+```
+
+Changes are written to `monitor_config.json` immediately and take effect live.
+
+**Direct JSON edit:** Modify `monitor_config.json` and restart the server.
+
+#### Monitor UI — fleet navigation
+
+| Element | Description |
+|---------|-------------|
+| Printer tabs | One tab per printer — click to switch the status card |
+| Tab dot colour | 🟢 printing, 🟡 paused, 🔴 error, ⚫ idle/standby |
+| ⚙ Manage button | Opens the manage panel (edit, rename, enable/disable, add new) |
+| Alert log | Combined across all printers; printer name shown on each entry |
+| Camera button | Fetches snapshot from the **currently selected** printer's webcam |
+
+#### Alert routing
+
+Alerts from all printers are dispatched over the same channels (ntfy, SMS, email, iMessage). Each notification includes the printer name so you always know which machine fired:
+
+```
+[Voron 2.4] CRITICAL
+Thermal anomaly — Bed: target 110°C actual 72.3°C
+```
+
+---
 
 Once the MCP server is configured, ask Claude:
 

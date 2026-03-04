@@ -352,7 +352,9 @@ body{background:#0a0a0f;color:#e2e8f0;font-family:'SF Mono','Fira Code',monospac
 .header-sub{font-size:11px;color:#475569;margin-top:2px}
 .header-meta{text-align:right;font-size:11px;color:#475569;line-height:1.8}
 .header-meta span{color:#94a3b8}
-.printer-tabs{display:flex;gap:6px;flex-wrap:wrap}
+/* Printer tabs row */
+.printer-tabs-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.printer-tabs{display:flex;gap:6px;flex-wrap:wrap;flex:1}
 .printer-tab{background:#1e293b;border:1px solid #334155;color:#94a3b8;font-family:inherit;font-size:12px;padding:6px 14px;border-radius:20px;cursor:pointer;display:flex;align-items:center;gap:6px;transition:all .15s}
 .printer-tab:hover{border-color:#475569;color:#cbd5e1}
 .printer-tab.active{background:#0f2a3f;border-color:#3b82f6;color:#60a5fa}
@@ -362,11 +364,16 @@ body{background:#0a0a0f;color:#e2e8f0;font-family:'SF Mono','Fira Code',monospac
 .dot-error{background:#ef4444;box-shadow:0 0 6px #ef444480}
 .dot-complete,.dot-cancelled,.dot-unknown,.dot-standby{background:#334155}
 @keyframes glow{0%,100%{opacity:1}50%{opacity:.5}}
+/* Manage button */
+.btn-manage{background:none;border:1px solid #334155;color:#475569;font-family:inherit;font-size:11px;padding:5px 10px;border-radius:16px;cursor:pointer;transition:all .15s;white-space:nowrap}
+.btn-manage:hover{border-color:#3b82f6;color:#60a5fa}
+/* Alert cards */
 .alert{border-radius:6px;padding:10px 14px;font-size:12px;font-weight:600;border-left:3px solid;margin-bottom:6px}
 .alert-critical{background:#1a0a0a;border-color:#ef4444;color:#fca5a5}
 .alert-warning{background:#1a150a;border-color:#f59e0b;color:#fcd34d}
 .alert-success{background:#0a1a0f;border-color:#22c55e;color:#86efac}
 .alert-ok{background:#0a1a0f;border-color:#22c55e;color:#86efac;font-weight:500}
+/* Status card */
 .card{background:#0f172a;border:1px solid #1e293b;border-radius:8px;padding:16px;display:flex;flex-direction:column;gap:14px}
 .badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;color:#fff}
 .badge-printing{background:#16a34a}.badge-paused{background:#d97706}
@@ -386,19 +393,23 @@ body{background:#0a0a0f;color:#e2e8f0;font-family:'SF Mono','Fira Code',monospac
 .temp-label{color:#475569;width:52px;font-size:11px}
 .temp-val{font-weight:700;font-size:13px}.temp-ok{color:#4ade80}.temp-bad{color:#f87171}
 .temp-target{color:#475569;font-size:11px}
+/* Alert channels */
 .channels{display:flex;gap:8px;flex-wrap:wrap}
 .ch{padding:2px 8px;border-radius:12px;font-size:10px;font-weight:600;border:1px solid}
 .ch-on{background:#0f2a1a;border-color:#22c55e;color:#4ade80}
 .ch-off{background:#1a1a1a;border-color:#334155;color:#475569}
+/* Buttons */
 .btn-row{display:flex;gap:8px;flex-wrap:wrap}
 .btn{flex:1;min-width:70px;background:#1e293b;border:1px solid #334155;color:#94a3b8;font-family:inherit;font-size:12px;padding:9px;border-radius:6px;cursor:pointer;transition:background .15s}
 .btn:hover:not(:disabled){background:#263347}.btn:disabled{opacity:.4;cursor:default}
+/* Camera */
 .camera-card{background:#0f172a;border:1px solid #1e293b;border-radius:8px;padding:14px}
 .camera-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
 .camera-title{font-size:11px;color:#94a3b8}
 .camera-hint{font-size:10px;color:#334155}
 #cameraImg{width:100%;border-radius:4px;background:#080c14;display:block}
 #cameraErr{color:#ef4444;font-size:11px;padding:20px;text-align:center;display:none}
+/* Alert log */
 .log{background:#0f172a;border:1px solid #1e293b;border-radius:8px;padding:14px}
 .log h3{font-size:11px;color:#475569;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}
 .log-list{max-height:240px;overflow-y:auto;display:flex;flex-direction:column;gap:5px}
@@ -408,6 +419,41 @@ body{background:#0a0a0f;color:#e2e8f0;font-family:'SF Mono','Fira Code',monospac
 .log-entry-success{background:#081408;border-color:#22c55e;color:#86efac}
 .log-printer{color:#3b82f6;font-size:10px;font-weight:700;margin-right:2px}
 .log-sent{color:#475569;font-size:10px;margin-top:3px}
+/* Manage printers panel */
+.panel{background:#0f172a;border:1px solid #1e293b;border-radius:8px;padding:16px;display:flex;flex-direction:column;gap:12px}
+.panel-title{font-size:12px;color:#94a3b8;font-weight:700;border-bottom:1px solid #1e293b;padding-bottom:8px;margin-bottom:4px}
+.printer-row{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #0f1a2e}
+.printer-row:last-child{border-bottom:none}
+.printer-row-info{flex:1;min-width:0}
+.printer-row-name{font-size:12px;color:#f1f5f9;font-weight:600}
+.printer-row-host{font-size:10px;color:#475569;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.printer-row-actions{display:flex;gap:5px;flex-shrink:0}
+.btn-sm{background:#1e293b;border:1px solid #334155;color:#94a3b8;font-family:inherit;font-size:10px;padding:4px 8px;border-radius:4px;cursor:pointer;transition:background .15s}
+.btn-sm:hover{background:#263347;color:#e2e8f0}
+.btn-sm-danger{border-color:#7f1d1d;color:#ef4444}
+.btn-sm-danger:hover{background:#1a0a0a}
+.btn-sm-success{border-color:#166534;color:#4ade80}
+.btn-sm-success:hover{background:#0a1a0f}
+/* Toggle */
+.toggle{position:relative;width:34px;height:18px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0}
+.toggle-slider{position:absolute;inset:0;background:#334155;border-radius:9px;cursor:pointer;transition:.2s}
+.toggle-slider::before{content:'';position:absolute;width:12px;height:12px;left:3px;top:3px;background:#94a3b8;border-radius:50%;transition:.2s}
+.toggle input:checked+.toggle-slider{background:#16a34a}
+.toggle input:checked+.toggle-slider::before{background:#fff;transform:translateX(16px)}
+/* Edit inputs */
+.edit-row{display:flex;flex-direction:column;gap:10px;padding:10px;background:#080c14;border-radius:6px;border:1px solid #1e293b}
+.edit-label{font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px}
+.edit-input{width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;font-family:inherit;font-size:12px;padding:6px 8px;border-radius:4px;outline:none}
+.edit-input:focus{border-color:#3b82f6}
+.edit-actions{display:flex;gap:6px;margin-top:4px}
+/* Add printer form */
+.add-form{display:flex;flex-direction:column;gap:8px}
+.add-form-row{display:flex;gap:8px}
+.add-input{flex:1;background:#0f172a;border:1px solid #334155;color:#e2e8f0;font-family:inherit;font-size:12px;padding:6px 8px;border-radius:4px;outline:none}
+.add-input:focus{border-color:#3b82f6}
+.add-input::placeholder{color:#334155}
+/* Misc */
 .section-label{font-size:10px;color:#334155;text-transform:uppercase;letter-spacing:.08em}
 .footer{text-align:center;font-size:10px;color:#1e293b;padding-top:4px}
 </style>
@@ -416,7 +462,7 @@ body{background:#0a0a0f;color:#e2e8f0;font-family:'SF Mono','Fira Code',monospac
 
 <div class="header">
   <div>
-    <div class="header-title">&#128424; Printer Fleet Monitor</div>
+    <div class="header-title">&#128424;&#65039; Printer Fleet Monitor</div>
     <div class="header-sub" id="activePrinterHost">connecting...</div>
   </div>
   <div class="header-meta">
@@ -426,11 +472,16 @@ body{background:#0a0a0f;color:#e2e8f0;font-family:'SF Mono','Fira Code',monospac
   </div>
 </div>
 
-<div id="printerTabsWrap" style="display:none">
+<!-- Printer tabs (always shown) -->
+<div>
   <div class="section-label" style="margin-bottom:6px">Printers</div>
-  <div class="printer-tabs" id="printerTabs"></div>
+  <div class="printer-tabs-row">
+    <div class="printer-tabs" id="printerTabs"></div>
+    <button class="btn-manage" onclick="toggleManagePanel()">&#9881; Manage</button>
+  </div>
 </div>
 
+<!-- Alert channels -->
 <div>
   <div class="section-label" style="margin-bottom:6px">Alert channels (server-side)</div>
   <div class="channels">
@@ -443,6 +494,7 @@ body{background:#0a0a0f;color:#e2e8f0;font-family:'SF Mono','Fira Code',monospac
 
 <div id="alertsContainer"></div>
 
+<!-- Status card -->
 <div class="card">
   <div style="display:flex;align-items:center;justify-content:space-between">
     <div style="display:flex;align-items:center;gap:8px">
@@ -481,6 +533,7 @@ body{background:#0a0a0f;color:#e2e8f0;font-family:'SF Mono','Fira Code',monospac
   </div>
 </div>
 
+<!-- Camera -->
 <div id="cameraSection" style="display:none">
   <div class="camera-card">
     <div class="camera-header">
@@ -493,13 +546,39 @@ body{background:#0a0a0f;color:#e2e8f0;font-family:'SF Mono','Fira Code',monospac
   </div>
 </div>
 
+<!-- Action buttons -->
 <div class="btn-row">
   <button class="btn" onclick="triggerPoll()">&#128260; Poll Now</button>
   <button class="btn" id="cameraBtn" onclick="toggleCamera()">&#128247; Camera</button>
   <button class="btn" onclick="sendTest()">&#128276; Test</button>
-  <button class="btn" onclick="openConfig()">&#9881; Config</button>
+  <button class="btn" onclick="openConfig()">&#128196; Config</button>
 </div>
 
+<!-- Manage Printers panel (hidden by default) -->
+<div id="managePanel" style="display:none">
+  <div class="panel">
+    <div class="panel-title">&#9881; Manage Printers</div>
+    <div id="printerRowList"></div>
+    <div id="editFormWrap"></div>
+    <!-- Add printer form -->
+    <div>
+      <div class="section-label" style="margin-bottom:8px">+ Add Printer</div>
+      <div class="add-form">
+        <div class="add-form-row">
+          <input class="add-input" id="addName" placeholder="Name (e.g. Voron 2.4)" />
+          <input class="add-input" id="addHost" placeholder="http://192.168.1.101" />
+        </div>
+        <div class="add-form-row">
+          <input class="add-input" id="addToken" placeholder="API token (optional)" style="flex:.5" />
+          <button class="btn" style="flex:.5;min-width:0" onclick="addPrinter()">&#43; Add</button>
+        </div>
+        <div id="addMsg" style="font-size:11px;color:#475569;min-height:14px"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Alert log -->
 <div class="log">
   <h3>Alert Dispatch Log</h3>
   <div class="log-list" id="alertLogList">
@@ -515,6 +594,7 @@ body{background:#0a0a0f;color:#e2e8f0;font-family:'SF Mono','Fira Code',monospac
 
 <script>
 var uiPollCount=0,activePrinterId=null,allPrinters=[],cameraVisible=false,cameraInterval=null,countdownID=null;
+var managePanelOpen=false,editingPrinterId=null;
 
 function fmtTime(s){
   if(s<0||s==null)return"\u2014";
@@ -529,19 +609,138 @@ function selectPrinter(pid){
   if(cameraVisible)refreshCamera();
 }
 
+/* ── Printer tabs ── */
 function renderPrinterTabs(printers){
-  var wrap=document.getElementById('printerTabsWrap');
   var tabs=document.getElementById('printerTabs');
-  if(printers.length<=1){wrap.style.display='none';return;}
-  wrap.style.display='block';
   tabs.innerHTML=printers.map(function(p){
     var s=(p.status&&p.status.print_stats&&p.status.print_stats.state)||'unknown';
-    var err=p.errors>0?'<span style="color:#ef4444;font-size:10px">(err)</span>':'';
-    return '<button class="printer-tab '+(p.id===activePrinterId?'active':'')+'" data-id="'+p.id+'" onclick="selectPrinter(\''+p.id+'\');refreshUI()">'+
-      '<span class="tab-dot dot-'+s+'"></span>'+p.name+err+'</button>';
+    var disabled=!p.enabled?'<span style="font-size:9px;color:#475569;margin-left:2px">off</span>':'';
+    var err=p.errors>0&&p.enabled?'<span style="color:#ef4444;font-size:9px;margin-left:2px">err</span>':'';
+    return '<button class="printer-tab '+(p.id===activePrinterId?'active':'')+
+      '" data-id="'+p.id+'" onclick="selectPrinter(\''+p.id+'\');refreshUI()">'+
+      '<span class="tab-dot dot-'+s+'"></span>'+esc(p.name)+disabled+err+'</button>';
   }).join('');
 }
 
+/* ── Manage panel ── */
+function toggleManagePanel(){
+  managePanelOpen=!managePanelOpen;
+  document.getElementById('managePanel').style.display=managePanelOpen?'block':'none';
+  if(managePanelOpen)renderManagePanel();
+}
+
+function renderManagePanel(){
+  var list=document.getElementById('printerRowList');
+  if(!allPrinters.length){list.innerHTML='<div style="color:#334155;font-size:11px">No printers configured.</div>';return;}
+  list.innerHTML=allPrinters.map(function(p){
+    var on=p.enabled!==false;
+    return '<div class="printer-row" id="row-'+p.id+'">'
+      +'<div class="printer-row-info">'
+      +  '<div class="printer-row-name">'+esc(p.name)+'</div>'
+      +  '<div class="printer-row-host">'+esc(p.host)+'</div>'
+      +'</div>'
+      +'<div class="printer-row-actions">'
+      +  '<button class="btn-sm" onclick="startEdit(\''+p.id+'\')">&#9998; Edit</button>'
+      +  '<label class="toggle" title="'+(on?'Enabled — click to disable':'Disabled — click to enable')+'">'
+      +    '<input type="checkbox" '+(on?'checked':'')+' onchange="toggleEnabled(\''+p.id+'\',this.checked)">'
+      +    '<span class="toggle-slider"></span>'
+      +  '</label>'
+      +'</div>'
+      +'</div>';
+  }).join('');
+  // Clear edit form if target printer no longer exists
+  if(editingPrinterId&&!allPrinters.find(function(p){return p.id===editingPrinterId;})){
+    editingPrinterId=null;
+    document.getElementById('editFormWrap').innerHTML='';
+  }
+}
+
+function startEdit(pid){
+  editingPrinterId=pid;
+  var p=allPrinters.find(function(x){return x.id===pid;});
+  if(!p)return;
+  document.getElementById('editFormWrap').innerHTML=
+    '<div class="edit-row">'
+    +'<div class="section-label" style="margin-bottom:6px">Editing: '+esc(p.name)+'</div>'
+    +'<div><div class="edit-label">Display Name</div>'
+    +  '<input class="edit-input" id="editName" value="'+esc(p.name)+'" /></div>'
+    +'<div><div class="edit-label">Host URL</div>'
+    +  '<input class="edit-input" id="editHost" value="'+esc(p.host)+'" /></div>'
+    +'<div><div class="edit-label">API Token (optional)</div>'
+    +  '<input class="edit-input" id="editToken" value="'+esc(p.api_token||'')+'" placeholder="leave blank if not needed" /></div>'
+    +'<div class="edit-actions">'
+    +  '<button class="btn-sm btn-sm-success" onclick="saveEdit(\''+pid+'\')">&#10003; Save</button>'
+    +  '<button class="btn-sm" onclick="cancelEdit()">Cancel</button>'
+    +'</div>'
+    +'<div id="editMsg" style="font-size:11px;color:#475569;min-height:14px"></div>'
+    +'</div>';
+  document.getElementById('editFormWrap').scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+
+function cancelEdit(){
+  editingPrinterId=null;
+  document.getElementById('editFormWrap').innerHTML='';
+}
+
+async function saveEdit(pid){
+  var name=document.getElementById('editName').value.trim();
+  var host=document.getElementById('editHost').value.trim();
+  var token=document.getElementById('editToken').value.trim();
+  var msg=document.getElementById('editMsg');
+  if(!name||!host){msg.textContent='Name and host are required.';msg.style.color='#ef4444';return;}
+  msg.textContent='Saving...';msg.style.color='#475569';
+  try{
+    var r=await fetch('/api/printers/'+pid,{method:'PATCH',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:name,host:host,api_token:token})});
+    var d=await r.json();
+    if(r.ok){
+      msg.textContent='Saved!';msg.style.color='#4ade80';
+      await refreshUI();
+      renderManagePanel();
+      setTimeout(cancelEdit,1200);
+    } else {
+      msg.textContent=d.error||'Error saving.';msg.style.color='#ef4444';
+    }
+  }catch(e){msg.textContent='Request failed: '+e.message;msg.style.color='#ef4444';}
+}
+
+async function toggleEnabled(pid,enabled){
+  try{
+    await fetch('/api/printers/'+pid,{method:'PATCH',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({enabled:enabled})});
+    await refreshUI();
+    if(managePanelOpen)renderManagePanel();
+  }catch(e){console.error(e);}
+}
+
+async function addPrinter(){
+  var name=document.getElementById('addName').value.trim();
+  var host=document.getElementById('addHost').value.trim();
+  var token=document.getElementById('addToken').value.trim();
+  var msg=document.getElementById('addMsg');
+  if(!name||!host){msg.textContent='Name and host are required.';msg.style.color='#ef4444';return;}
+  msg.textContent='Adding...';msg.style.color='#475569';
+  try{
+    var r=await fetch('/api/printers',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:name,host:host,api_token:token})});
+    var d=await r.json();
+    if(r.ok||r.status===201){
+      msg.textContent='Added! Starting poll thread...';msg.style.color='#4ade80';
+      document.getElementById('addName').value='';
+      document.getElementById('addHost').value='';
+      document.getElementById('addToken').value='';
+      await refreshUI();
+      if(managePanelOpen)renderManagePanel();
+    } else {
+      msg.textContent=d.error||'Error adding printer.';msg.style.color='#ef4444';
+    }
+  }catch(e){msg.textContent='Request failed: '+e.message;msg.style.color='#ef4444';}
+}
+
+/* ── Alert channels ── */
 function renderChannels(cfg){
   var map={ntfy:cfg.ntfy&&cfg.ntfy.enabled,sms:cfg.twilio&&cfg.twilio.enabled,
            email:cfg.email&&cfg.email.enabled,imessage:cfg.imessage&&cfg.imessage.enabled};
@@ -565,6 +764,7 @@ function updateCountdown(intervalSecs,lastPoll){
   },1000);
 }
 
+/* ── Status card ── */
 function renderStatus(s,name){
   var ps=s.print_stats||{},ext=s.extruder||{},bed=s.heater_bed||{},
       vsd=s.virtual_sdcard||{},th=s.toolhead||{},pos=th.position||[0,0,0,0];
@@ -623,12 +823,13 @@ function renderAlertLog(log){
     var t=new Date(e.time).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
     var sent=e.sent&&e.sent.length?'sent: '+e.sent.join(', '):'no channels enabled';
     var failed=e.failed&&e.failed.length?' \u00B7 failed: '+e.failed.map(function(f){return f[0];}).join(','):'';
-    var pname=e.printer?'<span class="log-printer">['+e.printer+']</span>':'';
-    return '<div class="log-entry log-entry-'+e.level+'"><span style="opacity:.5">['+t+']</span> '+pname+e.msg+
+    var pname=e.printer?'<span class="log-printer">['+esc(e.printer)+']</span>':'';
+    return '<div class="log-entry log-entry-'+e.level+'"><span style="opacity:.5">['+t+']</span> '+pname+esc(e.msg)+
       '<div class="log-sent">'+sent+failed+'</div></div>';
   }).join('');
 }
 
+/* ── Camera ── */
 function toggleCamera(){
   cameraVisible=!cameraVisible;
   document.getElementById('cameraSection').style.display=cameraVisible?'block':'none';
@@ -645,6 +846,7 @@ function refreshCamera(){
   img.src='/api/printers/'+activePrinterId+'/camera?t='+Date.now();
 }
 
+/* ── Actions ── */
 async function triggerPoll(){
   await fetch('/api/poll',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({printer_id:activePrinterId})});
@@ -657,6 +859,12 @@ async function sendTest(){
 }
 function openConfig(){window.open('/monitor_config.json','_blank');}
 
+/* ── XSS safety ── */
+function esc(s){
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+/* ── Main refresh loop ── */
 async function refreshUI(){
   document.getElementById('spinner').style.display='inline';
   try{
@@ -675,6 +883,7 @@ async function refreshUI(){
     }
     renderAlertLog(adata.alert_log);
     renderChannels(cfg);
+    if(managePanelOpen)renderManagePanel();
     uiPollCount++;
     document.getElementById('checkCount').textContent=uiPollCount;
     document.getElementById('lastCheck').textContent=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
@@ -720,7 +929,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin","*")
-        self.send_header("Access-Control-Allow-Methods","GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods","GET, POST, PATCH, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers","Content-Type")
         self.end_headers()
 
@@ -847,6 +1056,39 @@ class Handler(BaseHTTPRequestHandler):
 
         else:
             self.send_response(404); self.end_headers()
+
+    def do_PATCH(self):
+        """PATCH /api/printers/<id>  — rename, change host, or toggle enabled."""
+        path = self.path.split("?")[0]
+        if not path.startswith("/api/printers/"):
+            self.send_response(404); self.end_headers(); return
+
+        pid  = path[len("/api/printers/"):]
+        body = self._read_body()
+        if not pid:
+            self.send_json(400, {"error": "printer id required"}); return
+
+        found = False
+        for p in config.get("printers", []):
+            if p["id"] == pid:
+                if "name" in body:
+                    p["name"] = body["name"].strip()
+                if "host" in body:
+                    p["host"] = body["host"].strip().rstrip("/")
+                if "enabled" in body:
+                    p["enabled"] = bool(body["enabled"])
+                if "api_token" in body:
+                    p["api_token"] = body["api_token"].strip()
+                found = True
+                save_config()
+                # If re-enabled, ensure poll thread is running
+                if p.get("enabled", True):
+                    start_printer_thread(p)
+                self.send_json(200, {"ok": True, "printer": p})
+                break
+
+        if not found:
+            self.send_json(404, {"error": f"Printer '{pid}' not found"})
 
     def _proxy_to(self, host, path):
         target = host + ("/" + path.lstrip("/"))
