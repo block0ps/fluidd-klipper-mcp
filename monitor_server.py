@@ -17,7 +17,7 @@ Usage:
 Config: monitor_config.json (auto-created on first run, auto-migrates old format)
 """
 
-import sys, os, json, time, smtplib, threading, subprocess
+import sys, os, json, time, smtplib, threading, subprocess, uuid
 import urllib.request, urllib.error, urllib.parse
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -27,10 +27,11 @@ from socketserver import ThreadingMixIn
 class HTTPServer(ThreadingMixIn, _HTTPServer):
     """Thread-per-request so LLM calls never block the UI poll loop."""
     daemon_threads = True
-from datetime import datetime
+from datetime import datetime, timedelta
 
 ADD_PRINTER_MODE    = (len(sys.argv) > 1 and sys.argv[1] == "add-printer")
 CONFIGURE_LLM_MODE  = (len(sys.argv) > 1 and sys.argv[1] == "configure-llm")
+ENABLE_TIER3_MODE   = (len(sys.argv) > 1 and sys.argv[1] == "enable-tier3")
 PORT = 8484
 for _arg in sys.argv[1:]:
     if _arg.isdigit(): PORT = int(_arg)
@@ -52,6 +53,11 @@ DEFAULT_CONFIG = {
     "email":    {"enabled": False, "smtp_host": "smtp.gmail.com", "smtp_port": 587,
                  "username": "", "password": "", "from_address": "", "to_address": ""},
     "imessage": {"enabled": False, "to_number": ""},
+    "agent": {
+        "tier": 2,
+        "trust_mode": {"enabled": False, "expires_at": None, "duration_hours": 24},
+        "tier3": {"enabled": False, "expires_at": None}
+    },
     "llm": {
         "enabled": False,
         "provider": "anthropic",
@@ -70,96 +76,136 @@ global_lock   = threading.Lock()
 printer_states = {}
 poll_threads   = {}
 chat_history  = []           # in-memory; optionally persisted to chat_history.json
-chat_lock     = threading.Lock()
+chat_lock            = threading.Lock()
+pending_actions      = {}           # action_id -> pending-action dict
+pending_lock         = threading.Lock()
 
 # ── LLM adapter layer ─────────────────────────────────────────────────────────
 # To swap providers, change config["llm"]["provider"].
 # Each adapter speaks only stdlib urllib — zero extra dependencies.
 
 class LLMAdapter:
-    """Abstract base — subclasses implement chat()."""
-    def chat(self, messages: list, system: str) -> str:
+    """Abstract base. chat() returns (text_or_None, tool_calls, raw_assistant)."""
+    def chat(self, messages: list, system: str, tools: list = None):
         raise NotImplementedError
+    def chat_with_results(self, msgs, asst_raw, tc_results, system):
+        raise NotImplementedError
+    def _fmt_tool_oai(self, t):
+        return {"name": t["name"], "description": t["description"],
+                "parameters": t["parameters"]}
 
 class AnthropicAdapter(LLMAdapter):
     def __init__(self, api_key: str, model: str = "claude-haiku-4-5-20251001"):
-        self.api_key = api_key
-        self.model   = model
-
-    def chat(self, messages: list, system: str) -> str:
-        payload = json.dumps({
-            "model":      self.model,
-            "max_tokens": 2048,
-            "system":     system,
-            "messages":   messages,
-        }).encode()
+        self.api_key = api_key; self.model = model
+    def _fmt_tool(self, t):
+        return {"name": t["name"], "description": t["description"],
+                "input_schema": t["parameters"]}
+    def chat(self, messages: list, system: str, tools: list = None):
+        payload = {"model": self.model, "max_tokens": 2048,
+                   "system": system, "messages": messages}
+        if tools:
+            payload["tools"] = [self._fmt_tool(t) for t in tools]
         req = urllib.request.Request(
             "https://api.anthropic.com/v1/messages",
-            data=payload,
-            headers={
-                "x-api-key":         self.api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type":      "application/json",
-            },
-            method="POST"
-        )
+            data=json.dumps(payload).encode(),
+            headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read())
-        return data["content"][0]["text"]
+        content = data.get("content", [])
+        text = "\n".join(b["text"] for b in content if b.get("type") == "text") or None
+        calls = [{"id": b["id"], "name": b["name"], "args": b.get("input", {}), "raw": b}
+                 for b in content if b.get("type") == "tool_use"]
+        return text, calls, {"content": content}
+    def chat_with_results(self, msgs, asst_raw, tc_results, system):
+        m = list(msgs) + [
+            {"role": "assistant", "content": asst_raw["content"]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": tc["id"], "content": r}
+                for tc, r in tc_results]}]
+        text, _, _ = self.chat(m, system, [])
+        return text or ""
 
 class OpenAIAdapter(LLMAdapter):
-    """Works with OpenAI, Groq, Mistral, LM Studio, Together, and any
-    OpenAI-compatible endpoint."""
+    """OpenAI, Groq, Mistral, LM Studio, Together, OpenRouter, etc."""
     def __init__(self, api_key: str, model: str = "gpt-4o-mini",
                  base_url: str = "https://api.openai.com/v1"):
-        self.api_key  = api_key
-        self.model    = model
+        self.api_key = api_key; self.model = model
         self.base_url = base_url.rstrip("/")
-
-    def chat(self, messages: list, system: str) -> str:
-        full_messages = [{"role": "system", "content": system}] + messages
-        payload = json.dumps({
-            "model":      self.model,
-            "messages":   full_messages,
-            "max_tokens": 2048,
-        }).encode()
+    def chat(self, messages: list, system: str, tools: list = None):
+        full = [{"role": "system", "content": system}] + messages
+        payload = {"model": self.model, "messages": full, "max_tokens": 2048}
+        if tools:
+            payload["tools"] = [{"type": "function",
+                                  "function": self._fmt_tool_oai(t)} for t in tools]
+            payload["tool_choice"] = "auto"
         req = urllib.request.Request(
             f"{self.base_url}/chat/completions",
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type":  "application/json",
-            },
-            method="POST"
-        )
+            data=json.dumps(payload).encode(),
+            headers={"Authorization": f"Bearer {self.api_key}",
+                     "Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read())
-        return data["choices"][0]["message"]["content"]
+        msg = data["choices"][0]["message"]
+        text = msg.get("content") or None
+        raw_calls = msg.get("tool_calls") or []
+        calls = [{"id": c["id"], "name": c["function"]["name"],
+                  "args": json.loads(c["function"].get("arguments") or "{}"), "raw": c}
+                 for c in raw_calls]
+        return text, calls, msg
+    def chat_with_results(self, msgs, asst_raw, tc_results, system):
+        full = [{"role": "system", "content": system}] + list(msgs)
+        full.append({"role": "assistant", "content": asst_raw.get("content"),
+                     "tool_calls": asst_raw.get("tool_calls", [])})
+        for tc, r in tc_results:
+            full.append({"role": "tool", "tool_call_id": tc["id"], "content": r})
+        payload = {"model": self.model, "messages": full, "max_tokens": 2048}
+        req = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Authorization": f"Bearer {self.api_key}",
+                     "Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+        return data["choices"][0]["message"].get("content") or ""
 
 class OllamaAdapter(LLMAdapter):
-    """Talks to a local Ollama instance — no API key needed."""
-    def __init__(self, base_url: str = "http://localhost:11434",
-                 model: str = "llama3.2"):
-        self.base_url = base_url.rstrip("/")
-        self.model    = model
-
-    def chat(self, messages: list, system: str) -> str:
-        full_messages = [{"role": "system", "content": system}] + messages
-        payload = json.dumps({
-            "model":    self.model,
-            "messages": full_messages,
-            "stream":   False,
-        }).encode()
+    """Local Ollama — no API key. Tool calling requires llama3.1:8b+ or mistral-nemo."""
+    def __init__(self, base_url: str = "http://localhost:11434", model: str = "llama3.2"):
+        self.base_url = base_url.rstrip("/"); self.model = model
+    def chat(self, messages: list, system: str, tools: list = None):
+        full = [{"role": "system", "content": system}] + messages
+        payload = {"model": self.model, "messages": full, "stream": False}
+        if tools:
+            payload["tools"] = [{"type": "function",
+                                  "function": self._fmt_tool_oai(t)} for t in tools]
         req = urllib.request.Request(
             f"{self.base_url}/api/chat",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=120) as resp:
             data = json.loads(resp.read())
-        return data["message"]["content"]
-
+        msg = data.get("message", {})
+        text = msg.get("content") or None
+        raw_calls = msg.get("tool_calls") or []
+        calls = [{"id": f"call_{i}", "name": c["function"]["name"],
+                  "args": c["function"].get("arguments", {}), "raw": c}
+                 for i, c in enumerate(raw_calls)]
+        return text, calls, msg
+    def chat_with_results(self, msgs, asst_raw, tc_results, system):
+        full = [{"role": "system", "content": system}] + list(msgs)
+        full.append({"role": "assistant", "content": asst_raw.get("content", ""),
+                     "tool_calls": asst_raw.get("tool_calls", [])})
+        for _, r in tc_results:
+            full.append({"role": "tool", "content": r})
+        payload = {"model": self.model, "messages": full, "stream": False}
+        req = urllib.request.Request(
+            f"{self.base_url}/api/chat",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read())
+        return data.get("message", {}).get("content") or ""
 def get_llm_adapter() -> LLMAdapter:
     """Instantiate the active LLM adapter from config. Raises ValueError if misconfigured."""
     llm  = config.get("llm", {})
@@ -239,9 +285,25 @@ def build_system_prompt() -> str:
                   if config.get(k,{}).get("enabled")]
     lines.append(f"  Alert channels: {', '.join(enabled_ch) or 'none enabled'}")
     lines.append("")
+    # Agent capabilities section
+    tier = get_agent_tier()
+    trust = is_trust_active()
+    tier_names = {1: "Read-only (Tier 1)", 2: "Reversible actions (Tier 2)",
+                  3: "Full access including irreversible (Tier 3)"}
+    lines.append("## Agent Capabilities")
+    lines.append(f"  Active tier: {tier} — {tier_names.get(tier,str(tier))}")
+    lines.append(f"  Trust mode: {'ACTIVE — actions execute without confirmation' if trust else 'inactive — user confirms each action'}")
+    active_tools = get_active_tools()
+    lines.append(f"  Available tools: {chr(10).join('    ' + t['name'] + ' — ' + t['description'][:60] for t in active_tools)}")
+    lines.append("")
+    lines.append("Printer IDs for tool calls:")
+    for p_ in config.get("printers", []):
+        if p_.get("enabled", True):
+            lines.append(f"  {p_['id']} = {p_.get('name', p_['id'])}")
+    lines.append("")
     lines.append("Be concise and technically precise. Reference specific values when relevant.")
-    lines.append("You can help with: print status, troubleshooting, alert interpretation, "
-                 "Klipper/Moonraker config advice, scheduling, and 3D printing tips.")
+    lines.append("When taking actions, use tool calls rather than describing what you would do.")
+    lines.append("For multi-printer operations use printer_id='all' where supported.")
     return "\n".join(lines)
 
 def load_chat_history():
@@ -270,31 +332,409 @@ def save_chat_history():
     except Exception as e:
         print(f"  Warning: could not save chat history: {e}")
 
-def process_chat_message(user_message: str):
-    """Send a user message through the active LLM adapter.
-    Returns (reply_str, updated_history_list)."""
+# ── Agent tool registry ───────────────────────────────────────────────────────
+TOOL_REGISTRY = [
+    # ── Tier 1: read-only ─────────────────────────────────────────────────────
+    {"name": "get_printer_status", "tier": 1,
+     "description": "Get current status of one or all printers (state, temps, progress, alerts).",
+     "parameters": {"type": "object", "properties": {
+         "printer_id": {"type": "string", "description": "Printer ID, or omit for all"}},
+         "required": []}},
+    {"name": "list_files", "tier": 1,
+     "description": "List gcode files on a printer, newest first.",
+     "parameters": {"type": "object", "properties": {
+         "printer_id": {"type": "string", "description": "Printer ID"},
+         "limit": {"type": "integer", "description": "Max files to return (default 20)"}},
+         "required": ["printer_id"]}},
+    {"name": "get_alert_log", "tier": 1,
+     "description": "Get the recent monitor alert log.",
+     "parameters": {"type": "object", "properties": {
+         "limit": {"type": "integer", "description": "Number of recent alerts (default 20)"}},
+         "required": []}},
+    # ── Tier 2: reversible actions ────────────────────────────────────────────
+    {"name": "pause_print", "tier": 2,
+     "description": "Pause an active print job.",
+     "parameters": {"type": "object", "properties": {
+         "printer_id": {"type": "string",
+             "description": "Printer ID, or 'all' to pause all printing printers"}},
+         "required": ["printer_id"]}},
+    {"name": "resume_print", "tier": 2,
+     "description": "Resume a paused print job.",
+     "parameters": {"type": "object", "properties": {
+         "printer_id": {"type": "string",
+             "description": "Printer ID, or 'all' to resume all paused printers"}},
+         "required": ["printer_id"]}},
+    {"name": "set_temperature", "tier": 2,
+     "description": "Set hotend or bed temperature target (0 = off).",
+     "parameters": {"type": "object", "properties": {
+         "printer_id": {"type": "string", "description": "Printer ID"},
+         "heater": {"type": "string", "enum": ["hotend", "bed"]},
+         "temperature": {"type": "number", "description": "Target °C (0 to turn off)"}},
+         "required": ["printer_id", "heater", "temperature"]}},
+    {"name": "set_speed_factor", "tier": 2,
+     "description": "Set print speed factor as percentage (100 = normal).",
+     "parameters": {"type": "object", "properties": {
+         "printer_id": {"type": "string", "description": "Printer ID"},
+         "factor": {"type": "integer", "description": "Speed % (10-300)"}},
+         "required": ["printer_id", "factor"]}},
+    {"name": "set_flow_rate", "tier": 2,
+     "description": "Set extrusion flow rate as percentage (100 = normal).",
+     "parameters": {"type": "object", "properties": {
+         "printer_id": {"type": "string", "description": "Printer ID"},
+         "factor": {"type": "integer", "description": "Flow % (10-200)"}},
+         "required": ["printer_id", "factor"]}},
+    {"name": "trigger_poll", "tier": 2,
+     "description": "Force immediate status poll for one or all printers.",
+     "parameters": {"type": "object", "properties": {
+         "printer_id": {"type": "string", "description": "Printer ID or 'all'"}},
+         "required": []}},
+    # ── Tier 3: irreversible / high-risk ──────────────────────────────────────
+    {"name": "cancel_print", "tier": 3,
+     "description": "Cancel current print job. IRREVERSIBLE.",
+     "parameters": {"type": "object", "properties": {
+         "printer_id": {"type": "string", "description": "Printer ID or 'all'"}},
+         "required": ["printer_id"]}},
+    {"name": "delete_file", "tier": 3,
+     "description": "Delete a gcode file from printer storage. IRREVERSIBLE.",
+     "parameters": {"type": "object", "properties": {
+         "printer_id": {"type": "string", "description": "Printer ID"},
+         "filename": {"type": "string", "description": "Filename to delete"}},
+         "required": ["printer_id", "filename"]}},
+    {"name": "emergency_stop", "tier": 3,
+     "description": "Emergency stop. Requires firmware restart to recover. IRREVERSIBLE.",
+     "parameters": {"type": "object", "properties": {
+         "printer_id": {"type": "string", "description": "Printer ID"}},
+         "required": ["printer_id"]}},
+    {"name": "home_axes", "tier": 3,
+     "description": "Home one or more axes on a printer (moves print head).",
+     "parameters": {"type": "object", "properties": {
+         "printer_id": {"type": "string", "description": "Printer ID"},
+         "axes": {"type": "string", "description": "Axes to home e.g. 'XYZ', 'Z'"}},
+         "required": ["printer_id"]}},
+]
+
+# ── Agent tier / trust management ─────────────────────────────────────────────
+def get_agent_tier() -> int:
+    agent = config.get("agent", {})
+    t3    = agent.get("tier3", {})
+    if t3.get("enabled") and t3.get("expires_at"):
+        try:
+            if datetime.now() < datetime.fromisoformat(t3["expires_at"]):
+                return 3
+            _revert_tier3()
+        except Exception:
+            _revert_tier3()
+    return agent.get("tier", 2)
+
+def _revert_tier3():
+    a = config.setdefault("agent", {})
+    a.setdefault("tier3", {}).update({"enabled": False, "expires_at": None})
+    save_config()
+    print(f"  [{datetime.now().strftime('%H:%M:%S')}] Tier 3 expired — reverted to Tier {a.get('tier',2)}")
+
+def is_trust_active() -> bool:
+    t = config.get("agent", {}).get("trust_mode", {})
+    if not t.get("enabled"): return False
+    exp = t.get("expires_at")
+    if not exp: return False
+    try:
+        if datetime.now() < datetime.fromisoformat(exp): return True
+        _revert_trust(); return False
+    except Exception: return False
+
+def _revert_trust():
+    config.setdefault("agent", {}).setdefault("trust_mode", {}).update(
+        {"enabled": False, "expires_at": None})
+    save_config()
+
+def activate_trust(hours: int):
+    hours = max(1, min(168, int(hours)))
+    exp   = (datetime.now() + timedelta(hours=hours)).isoformat()
+    config.setdefault("agent", {}).setdefault("trust_mode", {}).update(
+        {"enabled": True, "expires_at": exp, "duration_hours": hours})
+    save_config()
+    print(f"  [{datetime.now().strftime('%H:%M:%S')}] Trust mode ON for {hours}h → {exp[:16]}")
+
+def enable_tier3(hours: int):
+    hours = max(1, min(168, int(hours)))
+    exp   = (datetime.now() + timedelta(hours=hours)).isoformat()
+    config.setdefault("agent", {}).setdefault("tier3", {}).update(
+        {"enabled": True, "expires_at": exp})
+    save_config()
+    print(f"  [{datetime.now().strftime('%H:%M:%S')}] Tier 3 ENABLED for {hours}h → {exp[:16]}")
+
+def get_active_tools() -> list:
+    tier = get_agent_tier()
+    return [t for t in TOOL_REGISTRY if t["tier"] <= tier]
+
+def agent_status_dict() -> dict:
+    """Serialisable agent status for /api/agent/status."""
+    agent = config.get("agent", {})
+    tier  = get_agent_tier()
+    trust = agent.get("trust_mode", {})
+    t3    = agent.get("tier3", {})
+    return {
+        "tier": tier,
+        "base_tier": agent.get("tier", 2),
+        "trust_active": is_trust_active(),
+        "trust_expires_at": trust.get("expires_at"),
+        "tier3_active": tier == 3,
+        "tier3_expires_at": t3.get("expires_at"),
+    }
+
+# ── Tool execution ─────────────────────────────────────────────────────────────
+def _mkr_post(printer, endpoint, data=None):
+    host = printer["host"].rstrip("/")
+    tok  = printer.get("api_token", "")
+    hdrs = {"Content-Type": "application/json", "Accept": "application/json"}
+    if tok: hdrs["X-Api-Key"] = tok
+    req  = urllib.request.Request(host + endpoint,
+           data=json.dumps(data or {}).encode(), headers=hdrs, method="POST")
+    with urllib.request.urlopen(req, timeout=15) as r: return json.loads(r.read())
+
+def _mkr_get(printer, endpoint):
+    host = printer["host"].rstrip("/")
+    tok  = printer.get("api_token", "")
+    hdrs = {"Accept": "application/json"}
+    if tok: hdrs["X-Api-Key"] = tok
+    req  = urllib.request.Request(host + endpoint, headers=hdrs)
+    with urllib.request.urlopen(req, timeout=15) as r: return json.loads(r.read())
+
+def _mkr_delete(printer, endpoint):
+    host = printer["host"].rstrip("/")
+    tok  = printer.get("api_token", "")
+    hdrs = {"Accept": "application/json"}
+    if tok: hdrs["X-Api-Key"] = tok
+    req  = urllib.request.Request(host + endpoint, headers=hdrs, method="DELETE")
+    with urllib.request.urlopen(req, timeout=15) as r: return json.loads(r.read())
+
+def _tool_no_printer(tool_name, args) -> str:
+    if tool_name == "get_alert_log":
+        limit = int(args.get("limit", 20))
+        with global_lock: entries = list(alert_log[:limit])
+        if not entries: return "No recent alerts."
+        return "\n".join(
+            f"[{e.get('time','')[:16]}] [{e.get('printer','')}] "
+            f"{e.get('level','').upper()}: {e.get('msg','')}"
+            for e in entries)
+    elif tool_name == "trigger_poll":
+        for pr in config.get("printers", []):
+            if pr.get("enabled", True):
+                threading.Thread(target=poll_once, args=(pr,), daemon=True).start()
+        return "✓ Poll triggered for all printers."
+    return f"Error: {tool_name} requires a printer_id."
+
+def execute_tool(tool_name: str, args: dict, printer_id: str) -> str:
+    pr = get_printer_by_id(printer_id)
+    if not pr: return f"Error: printer '{printer_id}' not found."
+    nm = pr.get("name", printer_id)
+    try:
+        if tool_name == "get_printer_status":
+            st = printer_states.get(printer_id, {})
+            with st.get("lock", threading.Lock()): s = dict(st.get("last_status", {}))
+            ps  = s.get("print_stats", {}); ext = s.get("extruder", {})
+            bed = s.get("heater_bed", {}); vsd = s.get("virtual_sdcard", {})
+            return (f"{nm}: {ps.get('state','unknown').upper()} "
+                    f"{vsd.get('progress',0)*100:.1f}% | "
+                    f"Hotend {ext.get('temperature',0):.1f}/{ext.get('target',0)}°C | "
+                    f"Bed {bed.get('temperature',0):.1f}/{bed.get('target',0)}°C | "
+                    f"File: {ps.get('filename','none')}")
+        elif tool_name == "list_files":
+            d = _mkr_get(pr, "/server/files/list?root=gcodes")
+            files = sorted(d.get("result", []),
+                           key=lambda f: f.get("modified", 0), reverse=True)
+            names = [f.get("path", f.get("filename","?"))
+                     for f in files[:int(args.get("limit", 20))]]
+            return f"{nm} ({len(names)} files): " + ", ".join(names)
+        elif tool_name == "pause_print":
+            _mkr_post(pr, "/printer/print/pause"); return f"✓ Paused {nm}."
+        elif tool_name == "resume_print":
+            _mkr_post(pr, "/printer/print/resume"); return f"✓ Resumed {nm}."
+        elif tool_name == "set_temperature":
+            heater = args.get("heater", "hotend"); temp = float(args.get("temperature", 0))
+            gcode  = f"M104 S{temp:.0f}" if heater == "hotend" else f"M140 S{temp:.0f}"
+            _mkr_post(pr, "/printer/gcode/script", {"script": gcode})
+            return f"✓ Set {nm} {heater} → {temp:.0f}°C."
+        elif tool_name == "set_speed_factor":
+            f_ = max(10, min(300, int(args.get("factor", 100))))
+            _mkr_post(pr, "/printer/gcode/script", {"script": f"M220 S{f_}"})
+            return f"✓ Set {nm} speed → {f_}%."
+        elif tool_name == "set_flow_rate":
+            f_ = max(10, min(200, int(args.get("factor", 100))))
+            _mkr_post(pr, "/printer/gcode/script", {"script": f"M221 S{f_}"})
+            return f"✓ Set {nm} flow → {f_}%."
+        elif tool_name == "trigger_poll":
+            threading.Thread(target=poll_once, args=(pr,), daemon=True).start()
+            return f"✓ Poll triggered for {nm}."
+        elif tool_name == "cancel_print":
+            _mkr_post(pr, "/printer/print/cancel"); return f"✓ Cancelled print on {nm}."
+        elif tool_name == "delete_file":
+            fname = args.get("filename", "")
+            if not fname: return "Error: filename required."
+            _mkr_delete(pr, f"/server/files/gcodes/{urllib.parse.quote(fname, safe='')}")
+            return f"✓ Deleted '{fname}' from {nm}."
+        elif tool_name == "emergency_stop":
+            _mkr_post(pr, "/printer/emergency_stop")
+            return f"✓ Emergency stop on {nm}. Firmware restart required."
+        elif tool_name == "home_axes":
+            axes = args.get("axes", "XYZ").upper()
+            _mkr_post(pr, "/printer/gcode/script", {"script": f"G28 {axes}"})
+            return f"✓ Homed {axes} on {nm}."
+        return f"Error: unknown tool '{tool_name}'."
+    except Exception as e:
+        return f"Error: {tool_name} on {nm} failed — {e}"
+
+def _action_description(tool: str, args: dict, printer_name: str) -> str:
+    m = {
+        "get_printer_status": f"Get status of {printer_name}",
+        "list_files":         f"List files on {printer_name}",
+        "get_alert_log":      "Get recent alert log",
+        "pause_print":        f"Pause print on {printer_name}",
+        "resume_print":       f"Resume print on {printer_name}",
+        "set_temperature":    f"Set {args.get('heater','?')} → {args.get('temperature','?')}°C on {printer_name}",
+        "set_speed_factor":   f"Set speed → {args.get('factor','?')}% on {printer_name}",
+        "set_flow_rate":      f"Set flow → {args.get('factor','?')}% on {printer_name}",
+        "trigger_poll":       f"Poll {printer_name} now",
+        "cancel_print":       f"⚠️ CANCEL print on {printer_name}",
+        "delete_file":        f"⚠️ DELETE '{args.get('filename','?')}' from {printer_name}",
+        "emergency_stop":     f"🚨 EMERGENCY STOP {printer_name}",
+        "home_axes":          f"Home axes {args.get('axes','XYZ')} on {printer_name}",
+    }
+    return m.get(tool, f"{tool} on {printer_name}")
+
+def expand_tool_calls(raw_calls: list) -> list:
+    """Expand 'all' printer_id targets into per-printer actions."""
+    printers = [p for p in config.get("printers", []) if p.get("enabled", True)]
+    expanded = []
+    for call in raw_calls:
+        name = call["name"]; args = call.get("args", {})
+        pid  = args.get("printer_id", "")
+        # Tools that operate on the monitor (no printer)
+        if name in ("get_alert_log",):
+            expanded.append({"tool": name, "args": args, "printer_id": None,
+                "printer_name": "Monitor", "call_id": call["id"],
+                "description": _action_description(name, args, "Monitor")})
+            continue
+        if name == "trigger_poll" and not pid:
+            expanded.append({"tool": name, "args": args, "printer_id": None,
+                "printer_name": "All printers", "call_id": call["id"],
+                "description": "Poll all printers now"})
+            continue
+        # Resolve target printers
+        if pid == "all" or not pid:
+            if name == "pause_print":
+                targets = [p for p in printers if printer_states.get(
+                    p["id"],{}).get("last_status",{}).get("print_stats",{}).get("state") == "printing"]
+            elif name == "resume_print":
+                targets = [p for p in printers if printer_states.get(
+                    p["id"],{}).get("last_status",{}).get("print_stats",{}).get("state") == "paused"]
+            else:
+                targets = printers
+        else:
+            pr = get_printer_by_id(pid)
+            targets = [pr] if pr else []
+        for pr in targets:
+            a = dict(args); a["printer_id"] = pr["id"]
+            pname = pr.get("name", pr["id"])
+            expanded.append({"tool": name, "args": a, "printer_id": pr["id"],
+                "printer_name": pname, "call_id": call["id"],
+                "description": _action_description(name, a, pname)})
+    return expanded
+
+def _record_chat(user_msg: str, reply: str):
+    llm_cfg = config.get("llm", {})
+    now = datetime.now().isoformat()
+    with chat_lock:
+        chat_history.append({"role": "user",      "content": user_msg,  "time": now})
+        chat_history.append({"role": "assistant",  "content": reply,
+                              "time": datetime.now().isoformat()})
+        mx = llm_cfg.get("history_max_messages", 100)
+        while len(chat_history) > mx: chat_history.pop(0)
+    save_chat_history()
+
+def _execute_pending(pending: dict):
+    """Execute all actions in a pending dict; return (final_reply, exec_log)."""
+    adapter  = get_llm_adapter()
+    expanded = pending["expanded"]
+    exec_log = []
+    by_call  = {}
+    for action in expanded:
+        if action["printer_id"]:
+            r = execute_tool(action["tool"], action["args"], action["printer_id"])
+        else:
+            r = _tool_no_printer(action["tool"], action["args"])
+        exec_log.append({"description": action["description"], "result": r})
+        print(f"  [Agent] {action['description']} → {r[:80]}")
+        cid = action["call_id"]
+        by_call.setdefault(cid, []).append(r)
+    # build tc_results aligned with original tool_calls
+    tc_results = [(tc, "\n".join(by_call.get(tc["id"], ["no result"])))
+                  for tc in pending["tool_calls"]]
+    final = adapter.chat_with_results(
+        pending["msg_payload"], pending["asst_raw"], tc_results, pending["system"])
+    return final, exec_log
+
+def process_chat_agentic(user_message: str):
+    """Agentic chat entry point. Returns a result dict the HTTP handler serialises."""
     llm_cfg = config.get("llm", {})
     if not llm_cfg.get("enabled", False):
         raise ValueError("LLM chat is not enabled. Open \u2699 settings to configure.")
     adapter = get_llm_adapter()
+    tools   = get_active_tools()
     system  = build_system_prompt()
     with chat_lock:
-        # Only send role/content to the LLM — strip internal metadata
-        msg_payload = [{"role": m["role"], "content": m["content"]}
-                       for m in chat_history]
+        msg_payload = [{"role": m["role"], "content": m["content"]} for m in chat_history]
     msg_payload.append({"role": "user", "content": user_message})
-    reply = adapter.chat(msg_payload, system)
-    now   = datetime.now().isoformat()
-    with chat_lock:
-        chat_history.append({"role": "user",      "content": user_message, "time": now})
-        chat_history.append({"role": "assistant", "content": reply,
-                             "time": datetime.now().isoformat()})
-        max_msgs = llm_cfg.get("history_max_messages", 100)
-        while len(chat_history) > max_msgs:
-            chat_history.pop(0)
-        history_copy = list(chat_history)
-    save_chat_history()
-    return reply, history_copy
+    # First LLM call
+    text, tool_calls, asst_raw = adapter.chat(msg_payload, system, tools)
+    if not tool_calls:
+        # Pure text response
+        _record_chat(user_message, text or "")
+        with chat_lock: hist = list(chat_history)
+        return {"type": "reply", "reply": text or "", "history": hist}
+    # Has tool calls
+    expanded = expand_tool_calls(tool_calls)
+    is_multi = len(expanded) > 1
+    if is_trust_active():
+        final, exec_log = _execute_pending({
+            "expanded": expanded, "tool_calls": tool_calls, "asst_raw": asst_raw,
+            "msg_payload": msg_payload, "system": system})
+        _record_chat(user_message, final)
+        with chat_lock: hist = list(chat_history)
+        return {"type": "reply", "reply": final, "history": hist, "exec_log": exec_log}
+    # Queue for confirmation
+    aid = uuid.uuid4().hex[:12]
+    with pending_lock:
+        pending_actions[aid] = {
+            "user_message": user_message, "msg_payload": msg_payload,
+            "asst_raw": asst_raw, "tool_calls": tool_calls, "expanded": expanded,
+            "system": system, "is_multi": is_multi,
+            "created_at": datetime.now().isoformat()}
+    return {
+        "type": "pending_action",
+        "action_id": aid,
+        "is_multi": is_multi,
+        "actions": [{"tool": a["tool"], "printer_id": a["printer_id"],
+                     "printer_name": a["printer_name"], "description": a["description"]}
+                    for a in expanded]}
+
+def confirm_pending(action_id: str, confirmed: bool, trust_hours: int = 0):
+    """Confirm or deny a pending action. Returns result dict."""
+    with pending_lock:
+        pending = pending_actions.pop(action_id, None)
+    if not pending:
+        return {"type": "reply", "reply": "Action expired or not found.", "history": []}
+    if not confirmed:
+        msg = "Action cancelled."
+        _record_chat(pending["user_message"], msg)
+        with chat_lock: hist = list(chat_history)
+        return {"type": "reply", "reply": msg, "history": hist}
+    if trust_hours and trust_hours > 0:
+        activate_trust(trust_hours)
+    final, exec_log = _execute_pending(pending)
+    _record_chat(pending["user_message"], final)
+    with chat_lock: hist = list(chat_history)
+    return {"type": "reply", "reply": final, "history": hist, "exec_log": exec_log}
 
 def _make_printer_state():
     return {"last_status": {}, "active_alerts": [], "fired_alerts": set(),
@@ -892,6 +1332,40 @@ body.fleet-mode .container{max-width:1120px}
 .chat-messages{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:9px;scroll-behavior:smooth}
 .chat-messages::-webkit-scrollbar{width:3px}
 .chat-messages::-webkit-scrollbar-thumb{background:#1e293b;border-radius:2px}
+/* Agent confirmation card */
+.action-card{background:#0f2137;border:1px solid #1e4a7a;border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:10px;font-size:12px}
+.action-card.tier3{border-color:#7f1d1d;background:#1a0a0a}
+.action-card-title{font-size:12px;font-weight:700;color:#93c5fd}
+.action-card.tier3 .action-card-title{color:#fca5a5}
+.action-list{display:flex;flex-direction:column;gap:4px}
+.action-item{font-size:11px;color:#cbd5e1;padding:3px 6px;background:#0a1929;border-radius:4px}
+.action-card.tier3 .action-item{color:#fecaca}
+.action-btns{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+.btn-confirm{background:#1d4ed8;color:#fff;border:none;border-radius:6px;padding:5px 13px;font-size:11px;font-weight:700;cursor:pointer}
+.btn-confirm:hover{background:#2563eb}
+.btn-deny{background:transparent;color:#94a3b8;border:1px solid #334155;border-radius:6px;padding:5px 11px;font-size:11px;cursor:pointer}
+.btn-deny:hover{border-color:#ef4444;color:#ef4444}
+.btn-abort{background:#7f1d1d;color:#fecaca;border:none;border-radius:6px;padding:5px 13px;font-size:11px;font-weight:700;cursor:pointer;animation:pulse-red 1s infinite}
+.btn-abort:hover{background:#991b1b}
+@keyframes pulse-red{0%,100%{opacity:1}50%{opacity:.75}}
+.countdown-bar{height:3px;background:#1e293b;border-radius:2px;overflow:hidden}
+.countdown-bar-fill{height:100%;background:#3b82f6;border-radius:2px;transition:width .25s linear}
+.countdown-txt{font-size:10px;color:#64748b;text-align:center}
+.trust-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.trust-row label{font-size:10px;color:#64748b;cursor:pointer;user-select:none}
+.trust-row select{font-size:10px;background:#0f172a;color:#94a3b8;border:1px solid #1e293b;border-radius:4px;padding:2px 4px}
+/* Agent/trust badge in header */
+.agent-badge{font-size:9px;padding:2px 6px;border-radius:8px;font-weight:700;margin-left:4px}
+.agent-badge-trust{background:#14532d;color:#4ade80;border:1px solid #166534}
+.agent-badge-t3{background:#7f1d1d;color:#fca5a5;border:1px solid #991b1b}
+.agent-badge-tier{background:#1e3a5f;color:#93c5fd;border:1px solid #1d4ed8}
+/* Tier 3 warning card in settings */
+.cs-t3-warn{background:#1a0a0a;border:1px solid #7f1d1d;border-radius:8px;padding:10px 12px;font-size:10px;color:#fca5a5;line-height:1.5}
+.cs-t3-active{background:#14000a;border:1px solid #be123c;border-radius:8px;padding:10px 12px}
+.cs-t3-active-title{font-size:11px;font-weight:700;color:#fca5a5;margin-bottom:4px}
+.cs-t3-countdown{font-size:10px;color:#fda4af}
+.btn-revoke{background:#7f1d1d;color:#fecaca;border:none;border-radius:5px;padding:4px 10px;font-size:10px;cursor:pointer;margin-top:6px}
+.btn-revoke:hover{background:#991b1b}
 .msg{max-width:90%;display:flex;flex-direction:column;gap:2px}
 .msg-user{align-self:flex-end;align-items:flex-end}
 .msg-ai{align-self:flex-start;align-items:flex-start}
@@ -1087,6 +1561,9 @@ body.fleet-mode .container{max-width:1120px}
       <div class="chat-header-title">
         &#129302; Fleet AI
         <span class="cs-provider-badge cs-badge-off" id="chatProvBadge">off</span>
+        <span class="agent-badge agent-badge-tier" id="agentTierBadge" style="display:none"></span>
+        <span class="agent-badge agent-badge-trust" id="agentTrustBadge" style="display:none">TRUST ON</span>
+        <span class="agent-badge agent-badge-t3" id="agentT3Badge" style="display:none">T3 ACTIVE</span>
       </div>
       <div class="chat-header-actions">
         <button class="chat-icon-btn" onclick="openChatSettings()" title="LLM Settings">&#9881;</button>
@@ -1179,6 +1656,39 @@ body.fleet-mode .container{max-width:1120px}
               min="0" max="240" step="5" value="30"
               style="width:70px;text-align:center"/>
             <span style="font-size:11px;color:#475569">min &nbsp;(0 = once only)</span>
+          </div>
+        </div>
+        <div class="cs-group">
+          <div class="cs-lbl">Agent &mdash; Action Tier</div>
+          <select class="cs-select" id="csTier" onchange="csTierChange()">
+            <option value="1">Tier 1 &mdash; Read-only</option>
+            <option value="2" selected>Tier 2 &mdash; Reversible actions</option>
+          </select>
+          <div style="font-size:10px;color:#475569;margin-top:2px">
+            Tier 3 (irreversible) requires CLI: <code style="color:#64748b">python3 monitor_server.py enable-tier3</code>
+          </div>
+        </div>
+        <div class="cs-group">
+          <div class="cs-lbl">Trust Mode</div>
+          <div class="cs-row">
+            <span class="cs-row-lbl">Default trust duration</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:7px;margin-top:2px">
+            <input class="cs-input" id="csTrustHours" type="number"
+              min="1" max="168" step="1" value="24"
+              style="width:60px;text-align:center"/>
+            <span style="font-size:11px;color:#475569">hours (1&ndash;168, used when trust checkbox shown)</span>
+          </div>
+        </div>
+        <div id="csT3Section" style="display:none">
+          <div class="cs-t3-active" id="csT3Active" style="display:none">
+            <div class="cs-t3-active-title">&#128680; Tier 3 Active</div>
+            <div class="cs-t3-countdown" id="csT3Countdown"></div>
+            <button class="btn-revoke" onclick="revokeT3()">Revoke Now</button>
+          </div>
+          <div class="cs-t3-warn" id="csT3Warn" style="display:none">
+            &#9888;&#65039; Tier 3 is currently <strong>inactive</strong>.
+            Enable via CLI only.
           </div>
         </div>
         <div class="cs-status" id="csStatus"></div>
@@ -1589,7 +2099,7 @@ function toggleChat(){
   document.getElementById('chatPanel').style.display=chatOpen?'flex':'none';
   document.getElementById('chatFabIcon').textContent=chatOpen?'\u2715':'\u{1F4AC}';
   if(chatOpen&&!chatLoaded){loadChatHistory();}
-  if(chatOpen)updateChatProvBadge();
+  if(chatOpen){updateChatProvBadge();refreshAgentStatus();}
 }
 
 function loadChatHistory(){
@@ -1654,16 +2164,36 @@ function chatKeydown(e){
   if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat();}
 }
 
+/* ── Agent state ── */
+var agentStatus={tier:2,trust_active:false,tier3_active:false};
+var pendingCountdowns={};  // action_id -> intervalID
+
+function refreshAgentStatus(){
+  fetch('/api/agent/status').then(function(r){return r.json();}).then(function(d){
+    agentStatus=d;
+    var tb=document.getElementById('agentTierBadge');
+    var trustB=document.getElementById('agentTrustBadge');
+    var t3B=document.getElementById('agentT3Badge');
+    if(tb){tb.textContent='T'+d.tier;tb.style.display='inline';}
+    if(trustB)trustB.style.display=d.trust_active?'inline':'none';
+    if(t3B)t3B.style.display=d.tier3_active?'inline':'none';
+  }).catch(function(){});
+}
+
 async function sendChat(){
   var inp=document.getElementById('chatInput');
   var msg=inp.value.trim();
   if(!msg)return;
+  // If there's an active multi-printer countdown, typing = abort
+  var activeCD=Object.keys(pendingCountdowns);
+  if(activeCD.length>0){
+    activeCD.forEach(function(aid){abortMultiAction(aid,true);});
+    return;
+  }
   inp.value='';inp.style.height='auto';
-  // Optimistic: add user message
   var now=new Date().toISOString();
   chatHistory.push({role:'user',content:msg,time:now});
   renderChatMessages();
-  // Typing indicator
   var box=document.getElementById('chatMessages');
   var typing=document.createElement('div');
   typing.className='chat-typing';typing.id='chatTyping';
@@ -1674,16 +2204,19 @@ async function sendChat(){
     var r=await fetch('/api/chat',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({message:msg})});
-    if(typing.parentNode)typing.remove();
+    if(typing&&typing.parentNode)typing.remove();
     var d=await r.json();
-    if(r.ok){
-      chatHistory=d.history||chatHistory;
-      renderChatMessages();
-    }else{
+    if(!r.ok){
       chatHistory.push({role:'assistant',
         content:'\u26a0\ufe0f Error: '+(d.error||'Unknown error'),
         time:new Date().toISOString()});
+      renderChatMessages();return;
+    }
+    if(d.type==='reply'){
+      chatHistory=d.history||chatHistory;
       renderChatMessages();
+    }else if(d.type==='pending_action'){
+      renderPendingAction(d);
     }
   }catch(err){
     if(document.getElementById('chatTyping'))document.getElementById('chatTyping').remove();
@@ -1693,7 +2226,136 @@ async function sendChat(){
     renderChatMessages();
   }finally{
     updateChatProvBadge();
+    refreshAgentStatus();
   }
+}
+
+function renderPendingAction(d){
+  var box=document.getElementById('chatMessages');
+  var isTier3=d.actions&&d.actions.some(function(a){
+    return['cancel_print','delete_file','emergency_stop'].includes(a.tool);
+  });
+  var card=document.createElement('div');
+  card.className='action-card'+(isTier3?' tier3':'');
+  card.id='action-card-'+d.action_id;
+
+  var title=document.createElement('div');
+  title.className='action-card-title';
+  title.textContent=d.is_multi
+    ?'\ud83e\udd16 Fleet action — '+d.actions.length+' printers'
+    :'\ud83e\udd16 Action requested';
+  card.appendChild(title);
+
+  var list=document.createElement('div');
+  list.className='action-list';
+  (d.actions||[]).forEach(function(a){
+    var it=document.createElement('div');
+    it.className='action-item';
+    it.textContent=a.description;
+    list.appendChild(it);
+  });
+  card.appendChild(list);
+
+  if(d.is_multi){
+    // 30-second countdown with abort
+    var cdBar=document.createElement('div');cdBar.className='countdown-bar';
+    var fill=document.createElement('div');fill.className='countdown-bar-fill';
+    fill.id='cd-fill-'+d.action_id;fill.style.width='100%';
+    cdBar.appendChild(fill);card.appendChild(cdBar);
+    var cdTxt=document.createElement('div');cdTxt.className='countdown-txt';
+    cdTxt.id='cd-txt-'+d.action_id;
+    cdTxt.textContent='Executing in 30s — type anything or click Abort to cancel';
+    card.appendChild(cdTxt);
+    var btns=document.createElement('div');btns.className='action-btns';
+    var abortBtn=document.createElement('button');
+    abortBtn.className='btn-abort';abortBtn.textContent='Abort';
+    abortBtn.onclick=function(){abortMultiAction(d.action_id,false);};
+    btns.appendChild(abortBtn);
+    card.appendChild(btns);
+    box.appendChild(card);box.scrollTop=box.scrollHeight;
+    // Start countdown
+    var secs=30,total=30;
+    var iv=setInterval(function(){
+      secs--;
+      var pct=(secs/total)*100;
+      var f=document.getElementById('cd-fill-'+d.action_id);
+      var t=document.getElementById('cd-txt-'+d.action_id);
+      if(f)f.style.width=pct+'%';
+      if(t)t.textContent='Executing in '+secs+'s — type anything or click Abort to cancel';
+      if(f)f.style.background=secs<=10?'#ef4444':'#3b82f6';
+      if(secs<=0){
+        clearInterval(iv);
+        delete pendingCountdowns[d.action_id];
+        executeConfirmedAction(d.action_id,false,0,card);
+      }
+    },1000);
+    pendingCountdowns[d.action_id]=iv;
+  } else {
+    // Normal: Confirm / Deny + optional trust checkbox
+    var btns=document.createElement('div');btns.className='action-btns';
+    var conf=document.createElement('button');
+    conf.className='btn-confirm';conf.textContent='Confirm';
+    conf.onclick=function(){
+      var th=parseInt(document.getElementById('trust-hrs-'+d.action_id).value)||0;
+      var useTrust=document.getElementById('trust-cb-'+d.action_id).checked;
+      executeConfirmedAction(d.action_id,true,useTrust?th:0,card);
+    };
+    var deny=document.createElement('button');
+    deny.className='btn-deny';deny.textContent='Deny';
+    deny.onclick=function(){executeConfirmedAction(d.action_id,false,0,card);};
+    btns.appendChild(conf);btns.appendChild(deny);
+
+    // Trust row
+    var trustRow=document.createElement('div');trustRow.className='trust-row';
+    var tcb=document.createElement('input');
+    tcb.type='checkbox';tcb.id='trust-cb-'+d.action_id;tcb.style.accentColor='#3b82f6';
+    var tsel=document.createElement('select');
+    tsel.id='trust-hrs-'+d.action_id;
+    [1,4,8,24,48,72,168].forEach(function(h){
+      var o=document.createElement('option');
+      o.value=h;o.textContent=h<24?h+'h':Math.round(h/24)+'d';
+      if(h===(agentStatus.trust_duration_hours||24))o.selected=true;
+      tsel.appendChild(o);
+    });
+    var tlbl=document.createElement('label');
+    tlbl.htmlFor='trust-cb-'+d.action_id;
+    tlbl.textContent='Trust LLM actions for';
+    trustRow.appendChild(tcb);trustRow.appendChild(tlbl);
+    trustRow.appendChild(tsel);
+    btns.appendChild(trustRow);
+    card.appendChild(btns);
+    box.appendChild(card);box.scrollTop=box.scrollHeight;
+  }
+  document.getElementById('chatSend').disabled=false;
+}
+
+function abortMultiAction(action_id, silent){
+  if(pendingCountdowns[action_id]){
+    clearInterval(pendingCountdowns[action_id]);
+    delete pendingCountdowns[action_id];
+  }
+  if(!silent) executeConfirmedAction(action_id,false,0,
+    document.getElementById('action-card-'+action_id));
+}
+
+async function executeConfirmedAction(action_id, confirmed, trust_hours, card){
+  if(card)card.remove();
+  var r=await fetch('/api/chat/action',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action_id:action_id,confirmed:confirmed,
+      trust_hours:trust_hours})});
+  var d=await r.json();
+  if(d.history)chatHistory=d.history;
+  // Show exec log if present
+  if(d.exec_log&&d.exec_log.length){
+    var log=d.exec_log.map(function(e){
+      return(e.result.startsWith('\u2713')?'\u2705 ':'  ')+e.description+'\n  '+e.result;
+    }).join('\n');
+    chatHistory.push({role:'assistant',content:log,time:new Date().toISOString()});
+  }
+  renderChatMessages();
+  refreshAgentStatus();
+  document.getElementById('chatSend').disabled=false;
 }
 
 /* ── Settings drawer ── */
@@ -1731,6 +2393,29 @@ function openChatSettings(){
         (llm.ollama&&llm.ollama.model)||'llama3.2';
     }
     csProviderChange();
+    // Agent settings
+    var agent=cfg.agent||{};
+    var tier=Math.min(2,agent.tier||2);
+    var tierSel=document.getElementById('csTier');
+    if(tierSel)tierSel.value=String(tier);
+    document.getElementById('csTrustHours').value=
+      (agent.trust_mode&&agent.trust_mode.duration_hours)||24;
+    // Tier 3 section
+    var t3=agent.tier3||{};
+    var t3sec=document.getElementById('csT3Section');
+    if(t3sec)t3sec.style.display='block';
+    var t3act=document.getElementById('csT3Active');
+    var t3warn=document.getElementById('csT3Warn');
+    if(t3.enabled&&t3.expires_at){
+      if(t3act){t3act.style.display='block';
+        document.getElementById('csT3Countdown').textContent=
+          'Active until: '+t3.expires_at.slice(0,16)+' ('+
+          Math.max(0,Math.round((new Date(t3.expires_at)-new Date())/3600000))+'h remaining)';}
+      if(t3warn)t3warn.style.display='none';
+    }else{
+      if(t3act)t3act.style.display='none';
+      if(t3warn)t3warn.style.display='block';
+    }
   });
 }
 
@@ -1765,9 +2450,12 @@ async function saveChatSettings(){
   status.textContent='Saving\u2026';status.style.color='#475569';
   var pollSecs=parseInt(document.getElementById('csPollSlider').value)*60;
   var escMins=parseInt(document.getElementById('csEscalateMinutes').value)||0;
+  var agentTier=parseInt((document.getElementById('csTier')||{value:'2'}).value)||2;
+  var trustHours=parseInt(document.getElementById('csTrustHours').value)||24;
   var payload={
     poll_interval_seconds: pollSecs,
     pause_escalate_minutes: escMins,
+    agent:{tier:agentTier,trust_mode:{duration_hours:trustHours}},
     llm:{enabled:enabled,provider:prov,history_enabled:histOn}
   };
   if(prov==='anthropic'){
@@ -1798,6 +2486,15 @@ async function saveChatSettings(){
       setTimeout(function(){status.textContent='';},2500);
     }else{status.textContent=d.error||'Error.';status.style.color='#ef4444';}
   }catch(e){status.textContent='Failed: '+e.message;status.style.color='#ef4444';}
+}
+
+async function revokeT3(){
+  if(!confirm('Revoke Tier 3 access immediately?'))return;
+  await fetch('/api/settings',{method:'PATCH',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({agent:{tier3:{enabled:false,expires_at:null}}})});
+  openChatSettings();
+  refreshAgentStatus();
 }
 
 async function clearChatHistory(){
@@ -1904,6 +2601,9 @@ class Handler(BaseHTTPRequestHandler):
                 history_copy = list(chat_history)
             self.send_json(200, {"history": history_copy})
 
+        elif path == "/api/agent/status":
+            self.send_json(200, agent_status_dict())
+
         elif path == "/api/alerts":
             with global_lock: lg = list(alert_log)
             self.send_json(200, {"alert_log": lg})
@@ -1974,8 +2674,8 @@ class Handler(BaseHTTPRequestHandler):
             if not msg:
                 self.send_json(400, {"error": "message is required"}); return
             try:
-                reply, history = process_chat_message(msg)
-                self.send_json(200, {"reply": reply, "history": history})
+                result = process_chat_agentic(msg)
+                self.send_json(200, result)
             except ValueError as e:
                 self.send_json(400, {"error": str(e)})
             except urllib.error.HTTPError as e:
@@ -1983,6 +2683,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(502, {"error": f"LLM API error {e.code}: {err_body[:300]}"})
             except Exception as e:
                 self.send_json(500, {"error": f"LLM error: {e}"})
+
+        elif path == "/api/chat/action":
+            body       = self._read_body()
+            action_id  = body.get("action_id","")
+            confirmed  = bool(body.get("confirmed", False))
+            trust_hrs  = int(body.get("trust_hours", 0))
+            if not action_id:
+                self.send_json(400, {"error": "action_id required"}); return
+            try:
+                result = confirm_pending(action_id, confirmed, trust_hrs)
+                self.send_json(200, result)
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path == "/api/trust":
+            body  = self._read_body()
+            hours = int(body.get("hours", 24))
+            activate_trust(hours)
+            self.send_json(200, {"ok": True, **agent_status_dict()})
 
         elif path == "/api/chat/clear":
             with chat_lock:
@@ -2034,6 +2753,19 @@ class Handler(BaseHTTPRequestHandler):
             if "pause_escalate_minutes" in body:
                 val = int(body["pause_escalate_minutes"])
                 config["pause_escalate_minutes"] = 0 if val == 0 else max(5, val)
+                changed = True
+            # ── Agent tier (1 or 2 only via web — tier3 requires CLI) ──
+            if "agent" in body:
+                a_patch = body["agent"]
+                a_conf  = config.setdefault("agent", {})
+                # tier3 changes are silently ignored here — CLI only
+                if "tier" in a_patch:
+                    a_conf["tier"] = max(1, min(2, int(a_patch["tier"])))
+                if "trust_mode" in a_patch:
+                    tm = a_patch["trust_mode"]
+                    if "duration_hours" in tm:
+                        a_conf.setdefault("trust_mode",{})["duration_hours"] = \
+                            max(1, min(168, int(tm["duration_hours"])))
                 changed = True
             # ── LLM settings ──
             if "llm" in body:
@@ -2196,6 +2928,38 @@ def cli_configure_llm():
     print(f"\n  LLM configured: {prov} | history: {'on' if upd['history_enabled'] else 'off'}")
     print("  Restart monitor_server.py to apply.\n")
 
+def cli_enable_tier3():
+    load_config()
+    print()
+    print("  +--------------------------------------------------+")
+    print("  |  Enable Tier 3 (Irreversible Actions)            |")
+    print("  |  cancel_print / delete_file / emergency_stop     |")
+    print("  |  home_axes                                        |")
+    print("  +--------------------------------------------------+")
+    print()
+    t3 = config.get("agent", {}).get("tier3", {})
+    if t3.get("enabled") and t3.get("expires_at"):
+        print(f"  Tier 3 currently ACTIVE until: {t3['expires_at'][:16]}")
+    else:
+        print("  Tier 3 currently: INACTIVE")
+    print()
+    print("  WARNING: Tier 3 allows the LLM to cancel prints,")
+    print("  delete files, and perform emergency stops.")
+    print("  These actions are IRREVERSIBLE.")
+    print()
+    yn = input("  Enable Tier 3? [y/N]: ").strip().lower()
+    if yn not in ("y", "yes"):
+        print("  Aborted."); return
+    raw = input("  Duration in hours [24] (max 168 = 7 days): ").strip()
+    hours = int(raw) if raw.isdigit() else 24
+    hours = max(1, min(168, hours))
+    enable_tier3(hours)
+    from datetime import datetime, timedelta
+    exp = (datetime.now() + timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M")
+    print(f"  Tier 3 ENABLED for {hours}h — expires {exp}")
+    print("  Restart monitor_server.py to apply (or it takes effect live).")
+    print()
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -2204,6 +2968,9 @@ if __name__ == "__main__":
         sys.exit(0)
     if CONFIGURE_LLM_MODE:
         cli_configure_llm()
+        sys.exit(0)
+    if ENABLE_TIER3_MODE:
+        cli_enable_tier3()
         sys.exit(0)
 
     load_config()
@@ -2240,6 +3007,11 @@ if __name__ == "__main__":
     else:
         _ls    = "OFF  (run: python3 monitor_server.py configure-llm)"
     print(f"  AI Chat  : {_ls}")
+    _tier = get_agent_tier()
+    _t3   = config.get("agent",{}).get("tier3",{})
+    _t3s  = f" [Tier 3 active until {_t3['expires_at'][:16]}]" if _t3.get("enabled") else ""
+    print(f"  Agent    : Tier {_tier}{_t3s}  |  Trust: {'ON' if is_trust_active() else 'off'}")
+    print(f"  enable-t3: python3 monitor_server.py enable-tier3")
     print(f"  Config   : monitor_config.json")
     print(f"  Add more : python3 monitor_server.py add-printer")
     print(f"  LLM setup: python3 monitor_server.py configure-llm")
