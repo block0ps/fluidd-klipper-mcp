@@ -2983,13 +2983,14 @@ function renderProfileList(llm){
     return '<option value="'+escAttr(pid)+'"'+(pid===active?' selected':'')+'>'+
            esc(p.name||pid)+' — '+provLabel+'</option>';
   }).join('');
-  // Profile rows
+  // Profile rows — use data attributes to avoid quote escaping in onclick
   var list = document.getElementById('csProfileList');
   list.innerHTML = Object.keys(profiles).map(function(pid){
     var p = profiles[pid];
     var isActive = pid === active;
     var provLabel = {anthropic:'Claude',openai:'OpenAI-compat',
                      ollama:'Ollama',gemini:'Gemini'}[p.provider]||p.provider;
+    var safePid = escAttr(pid);
     return '<div style="display:flex;align-items:center;gap:6px;padding:6px 8px;'
       +'background:#080c14;border-radius:6px;border:1px solid '
       +(isActive?'#1e4a7a':'#1e293b')+';">'
@@ -2997,14 +2998,23 @@ function renderProfileList(llm){
       +'<div style="font-size:12px;color:#f1f5f9;font-weight:'+(isActive?'700':'400')+';">'
       +esc(p.name||pid)+(isActive?' <span style="color:#3b82f6;font-size:10px">\u25cf active</span>':'')+'</div>'
       +'<div style="font-size:10px;color:#475569;margin-top:1px">'+provLabel
-      +(p.model?' · '+esc(p.model):'')+'</div>'
+      +(p.model?' \u00b7 '+esc(p.model):'')+'</div>'
       +'</div>'
-      +'<button class="btn-sm" onclick="testSavedProfile('+JSON.stringify(pid)+')" title="Test connection" style="border-color:#0e7490;color:#22d3ee">&#9654;</button>'
-      +'<button class="btn-sm" onclick="editProfile('+JSON.stringify(pid)+')" title="Edit">\u270e</button>'
-      +'<button class="btn-sm" onclick="deleteProfile('+JSON.stringify(pid)+')" '
-      +'style="color:#ef4444;border-color:#7f1d1d" title="Delete">\u00d7</button>'
+      +'<button class="btn-sm cs-prof-test" data-pid="'+safePid+'" title="Test connection" style="border-color:#0e7490;color:#22d3ee">&#9654;</button>'
+      +'<button class="btn-sm cs-prof-edit" data-pid="'+safePid+'" title="Edit">&#9998;</button>'
+      +'<button class="btn-sm cs-prof-del"  data-pid="'+safePid+'" style="color:#ef4444;border-color:#7f1d1d" title="Delete">\u00d7</button>'
       +'</div>';
   }).join('');
+  // Attach handlers via event delegation (avoids all quoting issues)
+  list.onclick = function(e){
+    var btn = e.target.closest('button');
+    if(!btn) return;
+    var pid = btn.getAttribute('data-pid');
+    if(!pid) return;
+    if(btn.classList.contains('cs-prof-test')) testSavedProfile(pid);
+    else if(btn.classList.contains('cs-prof-edit')) editProfile(pid);
+    else if(btn.classList.contains('cs-prof-del')) deleteProfile(pid);
+  };
 }
 
 function escAttr(s){return String(s||'').replace(/"/g,'&quot;');}
