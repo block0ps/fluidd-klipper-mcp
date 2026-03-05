@@ -60,14 +60,23 @@ DEFAULT_CONFIG = {
     },
     "llm": {
         "enabled": False,
-        "provider": "anthropic",
+        "active_profile": "groq",
         "history_enabled": True,
         "history_max_messages": 100,
-        "anthropic": {"api_key": "", "model": "claude-haiku-4-5-20251001"},
-        "openai":    {"api_key": "", "model": "gpt-4o-mini",
-                      "base_url": "https://api.openai.com/v1"},
-        "ollama":    {"base_url": "http://localhost:11434", "model": "llama3.2"},
-        "gemini":    {"api_key": "", "model": "gemini-2.0-flash"}
+        "profiles": {
+            "anthropic": {"name": "Claude (Anthropic)", "provider": "anthropic",
+                          "api_key": "", "model": "claude-haiku-4-5-20251001"},
+            "openai":    {"name": "OpenAI GPT-4o Mini", "provider": "openai",
+                          "api_key": "", "model": "gpt-4o-mini",
+                          "base_url": "https://api.openai.com/v1"},
+            "groq":      {"name": "Groq (Llama 3.3 70B)", "provider": "openai",
+                          "api_key": "", "model": "llama-3.3-70b-versatile",
+                          "base_url": "https://api.groq.com/openai/v1"},
+            "ollama":    {"name": "Local Ollama", "provider": "ollama",
+                          "base_url": "http://localhost:11434", "model": "llama3.2"},
+            "gemini":    {"name": "Gemini Flash (free)", "provider": "gemini",
+                          "api_key": "", "model": "gemini-2.0-flash"}
+        }
     }
 }
 
@@ -288,32 +297,68 @@ class GeminiAdapter(LLMAdapter):
         parts = data["candidates"][0]["content"]["parts"]
         return "\n".join(p["text"] for p in parts if "text" in p) or ""
 
+
+def _migrate_llm_config(llm: dict) -> dict:
+    """One-time migration: convert old flat per-provider format to profiles dict."""
+    if "profiles" in llm:
+        return llm  # already new format
+    profiles = {}
+    defaults = {
+        "anthropic": {"name": "Claude (Anthropic)",    "provider": "anthropic",
+                      "model": "claude-haiku-4-5-20251001"},
+        "openai":    {"name": "OpenAI GPT-4o Mini",    "provider": "openai",
+                      "model": "gpt-4o-mini",
+                      "base_url": "https://api.openai.com/v1"},
+        "ollama":    {"name": "Local Ollama",           "provider": "ollama",
+                      "model": "llama3.2",
+                      "base_url": "http://localhost:11434"},
+        "gemini":    {"name": "Gemini Flash (free)",    "provider": "gemini",
+                      "model": "gemini-2.0-flash"},
+    }
+    for pkey, defs in defaults.items():
+        old = llm.pop(pkey, {})
+        p   = dict(defs)
+        for k in ("api_key", "model", "base_url"):
+            if old.get(k): p[k] = old[k]
+        profiles[pkey] = p
+    old_prov = llm.pop("provider", "anthropic")
+    llm["profiles"] = profiles
+    if "active_profile" not in llm:
+        llm["active_profile"] = old_prov if old_prov in profiles else "anthropic"
+    print("  [Config] Migrated LLM config to profiles format.")
+    return llm
+
 def get_llm_adapter() -> LLMAdapter:
-    """Instantiate the active LLM adapter from config. Raises ValueError if misconfigured."""
-    llm  = config.get("llm", {})
-    prov = llm.get("provider", "anthropic")
+    """Instantiate the active LLM adapter from the active profile. Raises ValueError if misconfigured."""
+    llm     = config.get("llm", {})
+    pid     = llm.get("active_profile", "")
+    profile = llm.get("profiles", {}).get(pid, {})
+    if not profile:
+        raise ValueError(f"LLM profile {pid!r} not found. Configure a profile in ⚙ settings.")
+    prov  = profile.get("provider", "anthropic")
+    name  = profile.get("name", pid)
     if prov == "anthropic":
-        key   = llm.get("anthropic", {}).get("api_key", "").strip()
-        model = llm.get("anthropic", {}).get("model", "claude-haiku-4-5-20251001")
-        if not key: raise ValueError("Anthropic API key not configured.")
+        key   = profile.get("api_key", "").strip()
+        model = profile.get("model", "claude-haiku-4-5-20251001")
+        if not key: raise ValueError(f"Profile '{name}': Anthropic API key not configured.")
         return AnthropicAdapter(key, model)
     elif prov == "openai":
-        key   = llm.get("openai", {}).get("api_key", "").strip()
-        model = llm.get("openai", {}).get("model", "gpt-4o-mini")
-        base  = llm.get("openai", {}).get("base_url", "https://api.openai.com/v1")
-        if not key: raise ValueError("OpenAI API key not configured.")
+        key   = profile.get("api_key", "").strip()
+        model = profile.get("model", "gpt-4o-mini")
+        base  = profile.get("base_url", "https://api.openai.com/v1")
+        if not key: raise ValueError(f"Profile '{name}': OpenAI API key not configured.")
         return OpenAIAdapter(key, model, base)
     elif prov == "ollama":
-        base  = llm.get("ollama", {}).get("base_url", "http://localhost:11434")
-        model = llm.get("ollama", {}).get("model", "llama3.2")
+        base  = profile.get("base_url", "http://localhost:11434")
+        model = profile.get("model", "llama3.2")
         return OllamaAdapter(base, model)
     elif prov == "gemini":
-        key   = llm.get("gemini", {}).get("api_key", "").strip()
-        model = llm.get("gemini", {}).get("model", "gemini-2.0-flash")
-        if not key: raise ValueError("Gemini API key not configured.")
+        key   = profile.get("api_key", "").strip()
+        model = profile.get("model", "gemini-2.0-flash")
+        if not key: raise ValueError(f"Profile '{name}': Gemini API key not configured.")
         return GeminiAdapter(key, model)
     else:
-        raise ValueError(f"Unknown LLM provider: {prov!r}")
+        raise ValueError(f"Profile '{name}': Unknown provider {prov!r}")
 
 def build_system_prompt() -> str:
     """Inject live fleet state into the system prompt so the LLM always has context."""
@@ -1083,7 +1128,9 @@ def process_chat_agentic(user_message: str):
         if tool_calls:
             text    = cleaned or None
             # Build a synthetic asst_raw so chat_with_results works correctly
-            prov = config.get("llm", {}).get("provider", "anthropic")
+            _ap2  = config.get("llm", {}).get("active_profile", "")
+            _prof2 = config.get("llm", {}).get("profiles", {}).get(_ap2, {})
+            prov  = _prof2.get("provider", "anthropic")
             if prov in ("openai", "ollama"):
                 asst_raw = _make_oai_asst_raw(tool_calls, text)
             # For anthropic/gemini text-parsed calls are uncommon; best-effort
@@ -1176,6 +1223,7 @@ def load_config():
                                    "enabled": True, "api_token": ""}]
             print("  Migrated single-printer config to multi-printer format.")
         merged = json.loads(json.dumps(DEFAULT_CONFIG))
+        _migrate_llm_config(merged.setdefault("llm",{}))
         for k, v in saved.items():
             if isinstance(v, dict) and k in merged and isinstance(merged[k], dict):
                 merged[k].update(v)
@@ -1184,6 +1232,7 @@ def load_config():
         config = merged
     else:
         config = json.loads(json.dumps(DEFAULT_CONFIG))
+        _migrate_llm_config(config.setdefault("llm",{}))
         save_config()
         print(f"  Created {CONFIG_FILE} — edit to enable alert channels.\n")
 
@@ -2049,25 +2098,50 @@ body.fleet-mode .container{max-width:1120px}
           </div>
         </div>
         <div class="cs-group">
-          <div class="cs-lbl">Provider</div>
-          <select class="cs-select" id="csProvider" onchange="csProviderChange()">
-            <option value="anthropic">Anthropic (Claude)</option>
-            <option value="openai">OpenAI-compatible (Groq, Mistral, LM Studio&hellip;)</option>
-            <option value="ollama">Ollama (local / offline)</option>
-            <option value="gemini">Google Gemini (free tier)</option>
-          </select>
-        </div>
-        <div class="cs-group" id="csApiKeyGroup">
-          <div class="cs-lbl">API Key</div>
-          <input class="cs-input" id="csApiKey" type="password" placeholder="sk-&#8230;"/>
-        </div>
-        <div class="cs-group" id="csBaseUrlGroup" style="display:none">
-          <div class="cs-lbl">Base URL</div>
-          <input class="cs-input" id="csBaseUrl" placeholder="http://localhost:11434"/>
+          <div class="cs-lbl">Active Profile</div>
+          <select class="cs-select" id="csActiveProfile" onchange="switchActiveProfile()"></select>
         </div>
         <div class="cs-group">
-          <div class="cs-lbl">Model</div>
-          <input class="cs-input" id="csModel" placeholder="claude-haiku-4-5-20251001"/>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+            <div class="cs-lbl" style="margin:0">Profiles</div>
+            <button class="btn-sm btn-sm-success" onclick="startAddProfile()" style="font-size:10px;padding:3px 10px">+ Add</button>
+          </div>
+          <div id="csProfileList" style="display:flex;flex-direction:column;gap:5px"></div>
+        </div>
+        <!-- Inline profile editor (hidden until add/edit) -->
+        <div id="csProfileEditor" style="display:none">
+          <div class="cs-group" style="background:#060d1a;border:1px solid #1e4a7a;border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:8px;margin-bottom:0">
+            <div class="cs-lbl" id="csEditorTitle" style="margin-bottom:2px">Edit Profile</div>
+            <div>
+              <div class="cs-lbl">Name</div>
+              <input class="cs-input" id="csProfName" type="text" placeholder="e.g. Groq Llama 3.3"/>
+            </div>
+            <div>
+              <div class="cs-lbl">Provider</div>
+              <select class="cs-select" id="csProfProvider" onchange="csProfProviderChange()">
+                <option value="anthropic">Anthropic (Claude)</option>
+                <option value="openai">OpenAI-compatible (Groq, Mistral&hellip;)</option>
+                <option value="ollama">Ollama (local / offline)</option>
+                <option value="gemini">Google Gemini (free tier)</option>
+              </select>
+            </div>
+            <div id="csProfApiKeyGroup">
+              <div class="cs-lbl">API Key</div>
+              <input class="cs-input" id="csProfApiKey" type="password" placeholder="sk-&#8230;" autocomplete="off"/>
+            </div>
+            <div id="csProfBaseUrlGroup">
+              <div class="cs-lbl">Base URL</div>
+              <input class="cs-input" id="csProfBaseUrl" type="text" placeholder="https://api.openai.com/v1"/>
+            </div>
+            <div>
+              <div class="cs-lbl">Model</div>
+              <input class="cs-input" id="csProfModel" type="text" placeholder="model-name"/>
+            </div>
+            <div style="display:flex;gap:7px;margin-top:2px">
+              <button class="btn-sm btn-sm-success" onclick="saveProfile()" style="flex:1;padding:5px">Save</button>
+              <button class="btn-sm" onclick="cancelEditProfile()" style="flex:1;padding:5px">Cancel</button>
+            </div>
+          </div>
         </div>
         <div class="cs-group">
           <div class="cs-lbl">History</div>
@@ -2562,11 +2636,12 @@ function updateChatProvBadge(){
   fetch('/api/config').then(function(r){return r.json();}).then(function(cfg){
     var llm=cfg.llm||{};
     var on=!!llm.enabled;
-    var prov=llm.provider||'anthropic';
-    var labels={'anthropic':'Claude','openai':'OpenAI','ollama':'Ollama','gemini':'Gemini'};
+    var pid=llm.active_profile||'';
+    var profile=(llm.profiles||{})[pid]||{};
+    var label=profile.name||pid||'LLM';
     var badge=document.getElementById('chatProvBadge');
     if(badge){
-      badge.textContent=on?(labels[prov]||prov):'off';
+      badge.textContent=on?label:'off';
       badge.className='cs-provider-badge '+(on?'cs-badge-on':'cs-badge-off');
     }
     document.getElementById('chatSend').disabled=!on;
@@ -2826,74 +2901,189 @@ async function executeConfirmedAction(action_id, confirmed, trust_hours, card){
 }
 
 /* ── Settings drawer ── */
+var _llmCfgCache = {};     // full llm config cached from last /api/config fetch
+var _editingProfileId = null;  // null = new, string = editing existing
+
 function openChatSettings(){
   document.getElementById('chatSettings').style.display='flex';
   fetch('/api/config').then(function(r){return r.json();}).then(function(cfg){
-    var llm=cfg.llm||{};
-    var prov=llm.provider||'anthropic';
+    _llmCfgCache = cfg.llm||{};
+    var llm = _llmCfgCache;
     document.getElementById('csEnabled').checked=!!llm.enabled;
-    document.getElementById('csProvider').value=prov;
     document.getElementById('csHistoryEnabled').checked=llm.history_enabled!==false;
     var pollMin=Math.round((cfg.poll_interval_seconds||1800)/60);
-    // Clamp to slider range 5-60; values outside (e.g. 90 min) show as 60
     var sliderVal=Math.min(60,Math.max(5,pollMin));
     document.getElementById('csPollSlider').value=sliderVal;
     csPollSliderChange(sliderVal);
     document.getElementById('csEscalateMinutes').value=
       cfg.pause_escalate_minutes!=null?cfg.pause_escalate_minutes:30;
-    if(prov==='anthropic'){
-      document.getElementById('csApiKey').value=
-        (llm.anthropic&&llm.anthropic.api_key)?'\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7':'';
-      document.getElementById('csModel').value=
-        (llm.anthropic&&llm.anthropic.model)||'claude-haiku-4-5-20251001';
-    }else if(prov==='openai'){
-      document.getElementById('csApiKey').value=
-        (llm.openai&&llm.openai.api_key)?'\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7':'';
-      document.getElementById('csBaseUrl').value=
-        (llm.openai&&llm.openai.base_url)||'https://api.openai.com/v1';
-      document.getElementById('csModel').value=
-        (llm.openai&&llm.openai.model)||'gpt-4o-mini';
-    }else if(prov==='ollama'){
-      document.getElementById('csBaseUrl').value=
-        (llm.ollama&&llm.ollama.base_url)||'http://localhost:11434';
-      document.getElementById('csModel').value=
-        (llm.ollama&&llm.ollama.model)||'llama3.2';
-    }else if(prov==='gemini'){
-      document.getElementById('csApiKey').value=
-        (llm.gemini&&llm.gemini.api_key)?'\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7':'';
-      document.getElementById('csModel').value=
-        (llm.gemini&&llm.gemini.model)||'gemini-2.0-flash';
-    }
-    csProviderChange();
     // Agent settings
     var agent=cfg.agent||{};
-    var tier=Math.min(2,agent.tier||2);
     var tierSel=document.getElementById('csTier');
-    if(tierSel)tierSel.value=String(tier);
+    if(tierSel)tierSel.value=String(Math.min(2,agent.tier||2));
     document.getElementById('csTrustHours').value=
       (agent.trust_mode&&agent.trust_mode.duration_hours)||24;
-    // Tier 3 section
     var t3=agent.tier3||{};
     var t3sec=document.getElementById('csT3Section');
     if(t3sec)t3sec.style.display='block';
-    var t3act=document.getElementById('csT3Active');
-    var t3warn=document.getElementById('csT3Warn');
+    var t3act=document.getElementById('csT3Active'),t3warn=document.getElementById('csT3Warn');
     if(t3.enabled&&t3.expires_at){
       if(t3act){t3act.style.display='block';
         document.getElementById('csT3Countdown').textContent=
           'Active until: '+t3.expires_at.slice(0,16)+' ('+
           Math.max(0,Math.round((new Date(t3.expires_at)-new Date())/3600000))+'h remaining)';}
       if(t3warn)t3warn.style.display='none';
-    }else{
-      if(t3act)t3act.style.display='none';
-      if(t3warn)t3warn.style.display='block';
-    }
+    }else{if(t3act)t3act.style.display='none';if(t3warn)t3warn.style.display='block';}
+    renderProfileList(llm);
   });
 }
 
+function renderProfileList(llm){
+  var profiles = llm.profiles||{};
+  var active   = llm.active_profile||'';
+  // Rebuild active-profile selector
+  var sel = document.getElementById('csActiveProfile');
+  sel.innerHTML = Object.keys(profiles).map(function(pid){
+    var p = profiles[pid];
+    var provLabel = {anthropic:'Anthropic',openai:'OpenAI-compat',
+                     ollama:'Ollama',gemini:'Gemini'}[p.provider]||p.provider;
+    return '<option value="'+escAttr(pid)+'"'+(pid===active?' selected':'')+'>'+
+           esc(p.name||pid)+' — '+provLabel+'</option>';
+  }).join('');
+  // Profile rows
+  var list = document.getElementById('csProfileList');
+  list.innerHTML = Object.keys(profiles).map(function(pid){
+    var p = profiles[pid];
+    var isActive = pid === active;
+    var provLabel = {anthropic:'Claude',openai:'OpenAI-compat',
+                     ollama:'Ollama',gemini:'Gemini'}[p.provider]||p.provider;
+    return '<div style="display:flex;align-items:center;gap:6px;padding:6px 8px;'
+      +'background:#080c14;border-radius:6px;border:1px solid '
+      +(isActive?'#1e4a7a':'#1e293b')+';">'
+      +'<div style="flex:1;min-width:0">'
+      +'<div style="font-size:12px;color:#f1f5f9;font-weight:'+(isActive?'700':'400')+';">'
+      +esc(p.name||pid)+(isActive?' <span style="color:#3b82f6;font-size:10px">\u25cf active</span>':'')+'</div>'
+      +'<div style="font-size:10px;color:#475569;margin-top:1px">'+provLabel
+      +(p.model?' · '+esc(p.model):'')+'</div>'
+      +'</div>'
+      +'<button class="btn-sm" onclick="editProfile('+JSON.stringify(pid)+')" title="Edit">\u270e</button>'
+      +'<button class="btn-sm" onclick="deleteProfile('+JSON.stringify(pid)+')" '
+      +'style="color:#ef4444;border-color:#7f1d1d" title="Delete">\u00d7</button>'
+      +'</div>';
+  }).join('');
+}
+
+function escAttr(s){return String(s||'').replace(/"/g,'&quot;');}
+
+async function switchActiveProfile(){
+  var pid = document.getElementById('csActiveProfile').value;
+  var status = document.getElementById('csStatus');
+  status.textContent='Switching…';status.style.color='#475569';
+  var r = await fetch('/api/settings',{method:'PATCH',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({llm:{active_profile:pid}})});
+  var d = await r.json();
+  if(r.ok){
+    status.textContent='✅ Active!';status.style.color='#4ade80';
+    _llmCfgCache.active_profile = pid;
+    renderProfileList(_llmCfgCache);
+    updateChatProvBadge();
+    setTimeout(function(){status.textContent='';},1500);
+  }else{status.textContent=d.error||'Error';status.style.color='#ef4444';}
+}
+
+function startAddProfile(){
+  _editingProfileId = null;
+  document.getElementById('csEditorTitle').textContent = '+ New Profile';
+  document.getElementById('csProfName').value = '';
+  document.getElementById('csProfProvider').value = 'openai';
+  document.getElementById('csProfApiKey').value = '';
+  document.getElementById('csProfBaseUrl').value = '';
+  document.getElementById('csProfModel').value = '';
+  csProfProviderChange();
+  document.getElementById('csProfileEditor').style.display='block';
+  document.getElementById('csProfName').focus();
+}
+
+function editProfile(pid){
+  var p = (_llmCfgCache.profiles||{})[pid]||{};
+  _editingProfileId = pid;
+  document.getElementById('csEditorTitle').textContent = 'Edit — '+esc(p.name||pid);
+  document.getElementById('csProfName').value = p.name||'';
+  document.getElementById('csProfProvider').value = p.provider||'openai';
+  document.getElementById('csProfApiKey').value =
+    p.api_key ? '········' : '';
+  document.getElementById('csProfBaseUrl').value = p.base_url||'';
+  document.getElementById('csProfModel').value = p.model||'';
+  csProfProviderChange();
+  document.getElementById('csProfileEditor').style.display='block';
+}
+
+function cancelEditProfile(){
+  document.getElementById('csProfileEditor').style.display='none';
+  _editingProfileId = null;
+}
+
+async function saveProfile(){
+  var name    = document.getElementById('csProfName').value.trim();
+  var prov    = document.getElementById('csProfProvider').value;
+  var apiKey  = document.getElementById('csProfApiKey').value.trim();
+  var baseUrl = document.getElementById('csProfBaseUrl').value.trim();
+  var model   = document.getElementById('csProfModel').value.trim();
+  var status  = document.getElementById('csStatus');
+  if(!name){status.textContent='Name is required.';status.style.color='#ef4444';return;}
+  // Generate a stable ID from name if adding new
+  var pid = _editingProfileId || name.toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/_+$/,'');
+  var profileData = {id:pid, name:name, provider:prov, model:model};
+  if(prov==='ollama'){
+    profileData.base_url = baseUrl||'http://localhost:11434';
+  }else if(prov==='openai'){
+    profileData.base_url = baseUrl||'https://api.openai.com/v1';
+    if(apiKey&&apiKey!=='········') profileData.api_key=apiKey;
+    else if(_editingProfileId){/* keep existing key server-side */}
+  }else{
+    if(apiKey&&apiKey!=='········') profileData.api_key=apiKey;
+  }
+  status.textContent='Saving…';status.style.color='#475569';
+  var r = await fetch('/api/settings',{method:'PATCH',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({llm:{profile_upsert:profileData}})});
+  var d = await r.json();
+  if(r.ok){
+    status.textContent='✅ Saved!';status.style.color='#4ade80';
+    // Update local cache and re-render list
+    _llmCfgCache.profiles = _llmCfgCache.profiles||{};
+    _llmCfgCache.profiles[pid] = profileData;
+    renderProfileList(_llmCfgCache);
+    document.getElementById('csProfileEditor').style.display='none';
+    _editingProfileId=null;
+    updateChatProvBadge();
+    setTimeout(function(){status.textContent='';},2000);
+  }else{status.textContent=d.error||'Error';status.style.color='#ef4444';}
+}
+
+async function deleteProfile(pid){
+  var p = (_llmCfgCache.profiles||{})[pid]||{};
+  if(!confirm('Delete profile "'+((p.name)||pid)+'"?')) return;
+  var status = document.getElementById('csStatus');
+  status.textContent='Deleting…';status.style.color='#475569';
+  var r = await fetch('/api/settings',{method:'PATCH',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({llm:{profile_delete:pid}})});
+  var d = await r.json();
+  if(r.ok){
+    delete (_llmCfgCache.profiles||{})[pid];
+    if(_llmCfgCache.active_profile===pid){
+      _llmCfgCache.active_profile=Object.keys(_llmCfgCache.profiles||{})[0]||'';
+    }
+    renderProfileList(_llmCfgCache);
+    updateChatProvBadge();
+    status.textContent='✅ Deleted';status.style.color='#4ade80';
+    setTimeout(function(){status.textContent='';},1500);
+  }else{status.textContent=d.error||'Error';status.style.color='#ef4444';}
+}
+
 function csTierChange(){
-  // Tier 3 cannot be set via UI — selector only shows 1 and 2.
-  // If tier3 is currently active (injected server-side), show the T3 section.
   var sel=document.getElementById('csTier');
   if(sel)sel.value=Math.min(2,parseInt(sel.value)||2);
 }
@@ -2906,72 +3096,48 @@ function csPollSliderChange(v){
 function closeChatSettings(){
   document.getElementById('chatSettings').style.display='none';
   document.getElementById('csStatus').textContent='';
+  document.getElementById('csProfileEditor').style.display='none';
+  _editingProfileId=null;
 }
 
-function csProviderChange(){
-  var prov=document.getElementById('csProvider').value;
-  document.getElementById('csApiKeyGroup').style.display=
+function csProfProviderChange(){
+  var prov=document.getElementById('csProfProvider').value;
+  var ph={anthropic:'claude-haiku-4-5-20251001',openai:'gpt-4o-mini',
+          ollama:'qwen3:32b',gemini:'gemini-2.0-flash'};
+  document.getElementById('csProfModel').placeholder=ph[prov]||'model-name';
+  document.getElementById('csProfApiKeyGroup').style.display=
     prov==='ollama'?'none':'block';
-  document.getElementById('csBaseUrlGroup').style.display=
-    prov!=='anthropic'?'block':'none';
-  var ph={'anthropic':'claude-haiku-4-5-20251001','openai':'gpt-4o-mini',
-          'ollama':'llama3.2','gemini':'gemini-2.0-flash'};
-  document.getElementById('csModel').placeholder=ph[prov]||'model-name';
-  // Gemini uses API key but no base URL
-  if(prov==='gemini'){
-    document.getElementById('csApiKeyGroup').style.display='block';
-    document.getElementById('csBaseUrlGroup').style.display='none';
-    document.getElementById('csApiKey').placeholder='AIza...';
-  }else{
-    document.getElementById('csApiKey').placeholder='sk-\u2026';
-  }
+  document.getElementById('csProfBaseUrlGroup').style.display=
+    (prov==='openai'||prov==='ollama')?'block':'none';
+  if(prov==='gemini') document.getElementById('csProfApiKey').placeholder='AIza…';
+  else document.getElementById('csProfApiKey').placeholder='sk-…';
+  if(prov==='ollama')
+    document.getElementById('csProfBaseUrl').placeholder='http://localhost:11434';
+  else if(prov==='openai')
+    document.getElementById('csProfBaseUrl').placeholder='https://api.openai.com/v1';
 }
 
 async function saveChatSettings(){
-  var prov=document.getElementById('csProvider').value;
   var enabled=document.getElementById('csEnabled').checked;
-  var model=document.getElementById('csModel').value.trim();
   var histOn=document.getElementById('csHistoryEnabled').checked;
-  var apiKey=document.getElementById('csApiKey').value.trim();
-  var baseUrl=document.getElementById('csBaseUrl').value.trim();
   var status=document.getElementById('csStatus');
-  status.textContent='Saving\u2026';status.style.color='#475569';
+  status.textContent='Saving…';status.style.color='#475569';
   var pollSecs=parseInt(document.getElementById('csPollSlider').value)*60;
   var escMins=parseInt(document.getElementById('csEscalateMinutes').value)||0;
   var agentTier=parseInt((document.getElementById('csTier')||{value:'2'}).value)||2;
   var trustHours=parseInt(document.getElementById('csTrustHours').value)||24;
   var payload={
-    poll_interval_seconds: pollSecs,
-    pause_escalate_minutes: escMins,
+    poll_interval_seconds:pollSecs, pause_escalate_minutes:escMins,
     agent:{tier:agentTier,trust_mode:{duration_hours:trustHours}},
-    llm:{enabled:enabled,provider:prov,history_enabled:histOn}
+    llm:{enabled:enabled, history_enabled:histOn}
   };
-  if(prov==='anthropic'){
-    payload.llm.anthropic={model:model||'claude-haiku-4-5-20251001'};
-    if(apiKey&&apiKey!=='\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7')
-      payload.llm.anthropic.api_key=apiKey;
-  }else if(prov==='openai'){
-    payload.llm.openai={model:model||'gpt-4o-mini',
-      base_url:baseUrl||'https://api.openai.com/v1'};
-    if(apiKey&&apiKey!=='\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7')
-      payload.llm.openai.api_key=apiKey;
-  }else if(prov==='ollama'){
-    payload.llm.ollama={model:model||'llama3.2',
-      base_url:baseUrl||'http://localhost:11434'};
-  }else if(prov==='gemini'){
-    payload.llm.gemini={model:model||'gemini-2.0-flash'};
-    if(apiKey&&apiKey!=='\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7')
-      payload.llm.gemini.api_key=apiKey;
-  }
   try{
     var r=await fetch('/api/settings',{method:'PATCH',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(payload)});
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     var d=await r.json();
     if(r.ok){
-      status.textContent='\u2705 Saved!';status.style.color='#4ade80';
+      status.textContent='✅ Saved!';status.style.color='#4ade80';
       updateChatProvBadge();
-      // Refresh footer interval label
       var m=Math.round(pollSecs/60);
       var lbl=document.getElementById('intervalLabel');
       if(lbl)lbl.textContent=m>=60?(m/60)+'h':m+' min';
@@ -3106,8 +3272,8 @@ class Handler(BaseHTTPRequestHandler):
                 for k in ("auth_token","password"):
                     if safe.get(ch,{}).get(k): safe[ch][k] = "••••••••"
             for _prov in ("anthropic","openai","gemini"):
-                if safe.get("llm",{}).get(_prov,{}).get("api_key"):
-                    safe["llm"][_prov]["api_key"] = "••••••••"
+                for _pid, _prof in safe.get("llm",{}).get("profiles",{}).items():
+                    if _prof.get("api_key"): _prof["api_key"] = "••••••••"
             self.send_json(200, safe)
 
         elif path == "/api/status":  # backward compat — returns first printer status
@@ -3263,12 +3429,23 @@ class Handler(BaseHTTPRequestHandler):
             if "llm" in body:
                 llm_patch = body["llm"]
                 llm_conf  = config.setdefault("llm", {})
-                for k in ("enabled","provider","history_enabled","history_max_messages"):
-                    if k in llm_patch:
-                        llm_conf[k] = llm_patch[k]
-                for prov in ("anthropic","openai","ollama","gemini"):
-                    if prov in llm_patch:
-                        llm_conf.setdefault(prov, {}).update(llm_patch[prov])
+                _migrate_llm_config(llm_conf)
+                # Top-level flags
+                for k in ("enabled","active_profile","history_enabled","history_max_messages"):
+                    if k in llm_patch: llm_conf[k] = llm_patch[k]
+                # Profile upsert: {profile_id: {...fields...}}
+                if "profile_upsert" in llm_patch:
+                    pid = llm_patch["profile_upsert"]["id"]
+                    data = {k:v for k,v in llm_patch["profile_upsert"].items() if k != "id"}
+                    llm_conf.setdefault("profiles", {})[pid] = data
+                # Profile delete
+                if "profile_delete" in llm_patch:
+                    pid = llm_patch["profile_delete"]
+                    llm_conf.get("profiles", {}).pop(pid, None)
+                    # If deleted profile was active, switch to first remaining
+                    if llm_conf.get("active_profile") == pid:
+                        remaining = list(llm_conf.get("profiles", {}).keys())
+                        llm_conf["active_profile"] = remaining[0] if remaining else ""
                 changed = True
             if changed: save_config()
             self.send_json(200, {"ok": True,
