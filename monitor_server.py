@@ -74,6 +74,9 @@ DEFAULT_CONFIG = {
                           "base_url": "https://api.groq.com/openai/v1"},
             "ollama":    {"name": "Local Ollama", "provider": "ollama",
                           "base_url": "http://localhost:11434", "model": "llama3.2"},
+            "lmstudio":  {"name": "LM Studio (local)", "provider": "openai",
+                          "api_key": "", "model": "qwq-32b",
+                          "base_url": "http://localhost:1234/v1"},
             "gemini":    {"name": "Gemini Flash (free)", "provider": "gemini",
                           "api_key": "", "model": "gemini-2.0-flash"}
         }
@@ -149,12 +152,12 @@ class OpenAIAdapter(LLMAdapter):
             payload["tools"] = [{"type": "function",
                                   "function": self._fmt_tool_oai(t)} for t in tools]
             payload["tool_choice"] = "auto"
+        hdrs = {"Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (compatible; FleetMonitor/1.0)"}
+        if self.api_key: hdrs["Authorization"] = f"Bearer {self.api_key}"
         req = urllib.request.Request(
             f"{self.base_url}/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={"Authorization": f"Bearer {self.api_key}",
-                     "Content-Type": "application/json",
-                     "User-Agent": "Mozilla/5.0 (compatible; FleetMonitor/1.0)"}, method="POST")
+            data=json.dumps(payload).encode(), headers=hdrs, method="POST")
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read())
         msg = data["choices"][0]["message"]
@@ -171,12 +174,12 @@ class OpenAIAdapter(LLMAdapter):
         for tc, r in tc_results:
             full.append({"role": "tool", "tool_call_id": tc["id"], "content": r})
         payload = {"model": self.model, "messages": full, "max_tokens": 2048}
+        hdrs2 = {"Content-Type": "application/json",
+                 "User-Agent": "Mozilla/5.0 (compatible; FleetMonitor/1.0)"}
+        if self.api_key: hdrs2["Authorization"] = f"Bearer {self.api_key}"
         req = urllib.request.Request(
             f"{self.base_url}/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={"Authorization": f"Bearer {self.api_key}",
-                     "Content-Type": "application/json",
-                     "User-Agent": "Mozilla/5.0 (compatible; FleetMonitor/1.0)"}, method="POST")
+            data=json.dumps(payload).encode(), headers=hdrs2, method="POST")
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read())
         return data["choices"][0]["message"].get("content") or ""
@@ -345,8 +348,11 @@ def get_llm_adapter() -> LLMAdapter:
     elif prov == "openai":
         key   = profile.get("api_key", "").strip()
         model = profile.get("model", "gpt-4o-mini")
-        base  = profile.get("base_url", "https://api.openai.com/v1")
-        if not key: raise ValueError(f"Profile '{name}': OpenAI API key not configured.")
+        base  = profile.get("base_url", "https://api.openai.com/v1").strip()
+        # API key is optional for local servers (LM Studio, vLLM, Jan, etc.)
+        is_local = any(h in base for h in ("localhost","127.0.0.1","10.","192.168.","0.0.0.0"))
+        if not key and not is_local:
+            raise ValueError(f"Profile '{name}': API key required for remote OpenAI-compatible endpoints.")
         return OpenAIAdapter(key, model, base)
     elif prov == "ollama":
         base  = profile.get("base_url", "http://localhost:11434")
@@ -3312,7 +3318,9 @@ def _test_llm_profile(profile: dict) -> dict:
         elif prov == "openai":
             key  = profile.get("api_key", "").strip()
             base = profile.get("base_url", "https://api.openai.com/v1").strip()
-            if not key: raise ValueError("API key required.")
+            is_local = any(h in base for h in ("localhost","127.0.0.1","10.","192.168.","0.0.0.0"))
+            if not key and not is_local:
+                raise ValueError("API key required for remote endpoints.")
             adapter = OpenAIAdapter(key, model or "gpt-4o-mini", base)
         elif prov == "ollama":
             base = profile.get("base_url", "http://localhost:11434").strip()
