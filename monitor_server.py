@@ -960,9 +960,11 @@ def _execute_pending(pending: dict):
 
 
 def _strip_function_tags(text: str) -> str:
-    """Remove any remaining <function>...</function> tags from text (safety net)."""
-    if not text or '<function' not in text:
+    """Remove any remaining <function>...</function> tags and <think> blocks from text."""
+    if not text:
         return text
+    # Strip reasoning/thinking blocks (DeepSeek-R1, Qwen3, etc.)
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
     # Remove complete <function>name{...}</function> blocks
     text = re.sub(r'<function>\w+\{[^}]*\}</function>', '', text, flags=re.DOTALL)
     # Remove bare <function>name</function> (no args)
@@ -1074,7 +1076,10 @@ def process_chat_agentic(user_message: str):
     # as text instead of structured tool_calls. Detect and route them.
     if not tool_calls and text and '<function>' in text:
         print(f"  [{datetime.now().strftime('%H:%M:%S')}] [TextParser] Triggered for provider={config.get('llm',{}).get('provider','?')}")
-        cleaned, tool_calls = _parse_text_tool_calls(text)
+        # Strip reasoning blocks before parsing so <think> content doesn't
+        # confuse the tool call regex (DeepSeek-R1, Qwen3, etc.)
+        text_for_parse = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+        cleaned, tool_calls = _parse_text_tool_calls(text_for_parse)
         if tool_calls:
             text    = cleaned or None
             # Build a synthetic asst_raw so chat_with_results works correctly

@@ -167,3 +167,36 @@ When the LLM proposes an action, you'll see a confirmation card with optional tr
 - **Trust mode active:** Actions in the current tier execute immediately without confirmation
 
 Trust mode is set per-session through the confirmation dialog and expires automatically.
+
+---
+
+## Local Reasoning Models (Ollama)
+
+Reasoning models emit `<think>...</think>` blocks before answering. The monitor
+strips these automatically so they never appear in the chat UI.
+
+### Qwen3 32B (Recommended for high-end hardware)
+```bash
+ollama pull qwen3:32b     # ~20GB Q4 — fits comfortably in 128GB RAM
+```
+- Best tool-calling accuracy of any local model under 70B
+- Excellent at multi-step reasoning (diagnosing print issues, etc.)
+- M1 Ultra / M2 Ultra / M3 Ultra with ≥64GB RAM recommended
+- Append `/no_think` to model name for faster non-reasoning responses:
+  `qwen3:32b/no_think`
+
+### DeepSeek-R1
+```bash
+ollama pull deepseek-r1:8b    # ~5GB — reliable tool calling
+ollama pull deepseek-r1:14b   # ~9GB — better reasoning
+ollama pull deepseek-r1:70b   # ~43GB — near GPT-4 level
+```
+
+### Hardware guidance (Apple Silicon)
+| Model       | VRAM/RAM needed | M1 Pro 32GB | M1 Max 64GB | M1 Ultra 128GB |
+|-------------|----------------|-------------|-------------|----------------|
+| qwen3:8b    | ~5GB           | ✅           | ✅           | ✅              |
+| qwen3:14b   | ~9GB           | ✅           | ✅           | ✅              |
+| qwen3:32b   | ~20GB          | ⚠️ tight    | ✅           | ✅              |
+| qwen3:70b   | ~43GB          | ❌           | ⚠️ tight    | ✅              |
+| deepseek-r1:70b | ~43GB     | ❌           | ⚠️ tight    | ✅              |
