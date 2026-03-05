@@ -2164,8 +2164,15 @@ body.fleet-mode .container{max-width:1120px}
               <input class="cs-input" id="csProfModel" type="text" placeholder="model-name"/>
             </div>
             <div style="display:flex;gap:7px;margin-top:2px">
+              <button class="btn-sm" onclick="testProfile()" id="csProfTestBtn"
+                style="flex:1;padding:5px;border-color:#0e7490;color:#22d3ee">&#9654; Test</button>
               <button class="btn-sm btn-sm-success" onclick="saveProfile()" style="flex:1;padding:5px">Save</button>
               <button class="btn-sm" onclick="cancelEditProfile()" style="flex:1;padding:5px">Cancel</button>
+            </div>
+            <!-- Test result panel -->
+            <div id="csProfTestResult" style="display:none;margin-top:2px;padding:8px;
+              background:#060d1a;border-radius:6px;border:1px solid #1e293b;
+              font-size:11px;display:none;flex-direction:column;gap:5px">
             </div>
           </div>
         </div>
@@ -2992,6 +2999,7 @@ function renderProfileList(llm){
       +'<div style="font-size:10px;color:#475569;margin-top:1px">'+provLabel
       +(p.model?' · '+esc(p.model):'')+'</div>'
       +'</div>'
+      +'<button class="btn-sm" onclick="testSavedProfile('+JSON.stringify(pid)+')" title="Test connection" style="border-color:#0e7490;color:#22d3ee">&#9654;</button>'
       +'<button class="btn-sm" onclick="editProfile('+JSON.stringify(pid)+')" title="Edit">\u270e</button>'
       +'<button class="btn-sm" onclick="deleteProfile('+JSON.stringify(pid)+')" '
       +'style="color:#ef4444;border-color:#7f1d1d" title="Delete">\u00d7</button>'
@@ -3047,7 +3055,75 @@ function editProfile(pid){
 
 function cancelEditProfile(){
   document.getElementById('csProfileEditor').style.display='none';
+  document.getElementById('csProfTestResult').style.display='none';
   _editingProfileId = null;
+}
+
+async function testProfile(){
+  // Test using the current editor form values (not yet saved)
+  var prov    = document.getElementById('csProfProvider').value;
+  var apiKey  = document.getElementById('csProfApiKey').value.trim();
+  var baseUrl = document.getElementById('csProfBaseUrl').value.trim();
+  var model   = document.getElementById('csProfModel').value.trim();
+  var profile = {provider:prov, model:model};
+  if(prov==='ollama') profile.base_url=baseUrl||'http://localhost:11434';
+  else if(prov==='openai'){
+    profile.base_url=baseUrl||'https://api.openai.com/v1';
+    if(apiKey&&apiKey!=='\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7') profile.api_key=apiKey;
+  }else{
+    if(apiKey&&apiKey!=='\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7\u00b7') profile.api_key=apiKey;
+  }
+  // If editing existing and no new key entered, server will use saved key
+  if(_editingProfileId&&!profile.api_key) profile.profile_id=_editingProfileId;
+  await _runLLMTest(profile, null, document.getElementById('csProfTestResult'),
+                   document.getElementById('csProfTestBtn'));
+}
+
+async function testSavedProfile(pid){
+  // Test a saved profile by ID — show result in a tooltip-style div
+  var row = document.getElementById('csTestRow_'+pid);
+  if(!row){
+    row = document.createElement('div');
+    row.id='csTestRow_'+pid;
+    row.style.cssText='margin-top:4px;padding:7px 8px;background:#060d1a;border-radius:6px;border:1px solid #1e293b;font-size:11px';
+    var list=document.getElementById('csProfileList');
+    list.appendChild(row);
+  }
+  await _runLLMTest(null, pid, row, null);
+}
+
+async function _runLLMTest(profile, profileId, resultEl, btnEl){
+  if(btnEl){btnEl.disabled=true;btnEl.textContent='\u23f3 Testing\u2026';}
+  resultEl.style.display='flex';
+  resultEl.innerHTML='<span style="color:#475569">\u23f3 Connecting\u2026</span>';
+  var payload={};
+  if(profile) payload.profile=profile;
+  else payload.profile_id=profileId;
+  try{
+    var r=await fetch('/api/llm/test',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    var d=await r.json();
+    var stepsHtml=(d.steps||[]).map(function(s){
+      var icon=s.ok?'\u2705':'\u274c';
+      return '<div style="display:flex;gap:6px;align-items:baseline">'
+        +'<span style="width:80px;color:#475569;flex-shrink:0">'+esc(s.label)+'</span>'
+        +'<span>'+icon+'</span>'
+        +'<span style="color:'+(s.ok?'#86efac':'#fca5a5')+'">'+esc(s.detail||'')+'</span>'
+        +'</div>';
+    }).join('');
+    var responseHtml=d.response
+      ?'<div style="margin-top:6px;padding:6px 8px;background:#0f172a;border-radius:4px;'
+       +'color:#cbd5e1;font-style:italic;border-left:2px solid #3b82f6">'
+       +esc(d.response)+'</div>':
+      (d.error?'<div style="color:#fca5a5;margin-top:4px">\u26a0\ufe0f '+esc(d.error)+'</div>':'');
+    resultEl.innerHTML=stepsHtml+responseHtml;
+    resultEl.style.borderColor=d.ok?'#166534':'#7f1d1d';
+  }catch(e){
+    resultEl.innerHTML='<span style="color:#fca5a5">\u26a0\ufe0f '+esc(e.message)+'</span>';
+    resultEl.style.borderColor='#7f1d1d';
+  }finally{
+    if(btnEl){btnEl.disabled=false;btnEl.textContent='\u25b6 Test';}
+  }
 }
 
 async function saveProfile(){
@@ -3207,6 +3283,74 @@ setInterval(refreshUI,30000);
 </script></body></html>"""
 
 
+# ── LLM connectivity test ──────────────────────────────────────────────────────
+
+def _test_llm_profile(profile: dict) -> dict:
+    """Send a minimal test message to the LLM and return structured diagnostics."""
+    import time
+    prov  = profile.get("provider", "openai")
+    model = profile.get("model", "")
+    step_adapter = {"label": "Adapter", "ok": False, "detail": ""}
+    step_connect = {"label": "Connection", "ok": False, "detail": ""}
+    step_respond = {"label": "Response", "ok": False, "detail": ""}
+    # ── Build adapter ──────────────────────────────────────────────────────
+    try:
+        if prov == "anthropic":
+            key = profile.get("api_key", "").strip()
+            if not key: raise ValueError("API key required.")
+            adapter = AnthropicAdapter(key, model or "claude-haiku-4-5-20251001")
+        elif prov == "openai":
+            key  = profile.get("api_key", "").strip()
+            base = profile.get("base_url", "https://api.openai.com/v1").strip()
+            if not key: raise ValueError("API key required.")
+            adapter = OpenAIAdapter(key, model or "gpt-4o-mini", base)
+        elif prov == "ollama":
+            base = profile.get("base_url", "http://localhost:11434").strip()
+            adapter = OllamaAdapter(base, model or "llama3.2")
+        elif prov == "gemini":
+            key = profile.get("api_key", "").strip()
+            if not key: raise ValueError("API key required.")
+            adapter = GeminiAdapter(key, model or "gemini-2.0-flash")
+        else:
+            raise ValueError(f"Unknown provider: {prov!r}")
+        step_adapter["ok"] = True
+        step_adapter["detail"] = f"{prov} / {model or '(default)'}"
+    except Exception as e:
+        step_adapter["detail"] = str(e)
+        return {"ok": False, "error": str(e), "latency_ms": None, "response": None,
+                "steps": [step_adapter, step_connect, step_respond]}
+    # ── Send test prompt ───────────────────────────────────────────────────
+    test_msgs = [{"role": "user", "content":
+                  "Reply with exactly one sentence confirming you are online "
+                  "and state your model name. Do not use any tools."}]
+    t0 = time.time()
+    try:
+        text, tool_calls, _ = adapter.chat(
+            test_msgs, "You are a connectivity test. Reply concisely.", tools=[])
+        latency_ms = int((time.time() - t0) * 1000)
+        step_connect["ok"] = True
+        step_connect["detail"] = f"{latency_ms} ms"
+        reply = _strip_function_tags(text or "").strip()
+        if not reply and tool_calls:
+            reply = f"(model called tool: {tool_calls[0]['name']})"
+        step_respond["ok"] = bool(reply)
+        step_respond["detail"] = reply[:140] if reply else "Empty response — model returned nothing"
+        all_ok = step_connect["ok"] and step_respond["ok"]
+        return {"ok": all_ok, "latency_ms": latency_ms, "response": reply,
+                "model": model,
+                "steps": [step_adapter, step_connect, step_respond]}
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode(errors="ignore")[:300]
+        err = f"HTTP {e.code}: {err_body}"
+        step_connect["detail"] = err
+        return {"ok": False, "error": err, "latency_ms": None, "response": None,
+                "steps": [step_adapter, step_connect, step_respond]}
+    except Exception as e:
+        step_connect["detail"] = str(e)
+        return {"ok": False, "error": str(e), "latency_ms": None, "response": None,
+                "steps": [step_adapter, step_connect, step_respond]}
+
+
 # ── HTTP handler ───────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
@@ -3351,6 +3495,25 @@ class Handler(BaseHTTPRequestHandler):
                 args=("warning","Test alert — all enabled channels should receive this", pname),
                 daemon=True).start()
             self.send_json(200, {"ok": True})
+
+
+        elif path == "/api/llm/test":
+            body = self._read_body()
+            # Build a temporary adapter from the provided profile data
+            # (so the user can test BEFORE saving)
+            profile = body.get("profile")  # unsaved profile dict from editor
+            if not profile:
+                # Fall back to the named profile in config
+                pid = body.get("profile_id") or config.get("llm",{}).get("active_profile","")
+                profile = config.get("llm",{}).get("profiles",{}).get(pid,{})
+            if not profile:
+                self.send_json(400,{"ok":False,"error":"No profile specified."}); return
+            try:
+                result = _test_llm_profile(profile)
+                self.send_json(200, result)
+            except Exception as e:
+                self.send_json(200, {"ok": False, "error": str(e),
+                                     "latency_ms": None, "response": None})
 
         elif path == "/api/chat":
             body = self._read_body()
