@@ -1005,16 +1005,35 @@ def _execute_pending(pending: dict):
 
 
 def _strip_function_tags(text: str) -> str:
-    """Remove any remaining <function>...</function> tags and <think> blocks from text."""
+    """Remove <function> tags and extract the real response from reasoning models.
+
+    For models that emit <think>...</think> blocks (DeepSeek-R1, Qwen3):
+    - If text after </think> is non-empty, return that (the actual response)
+    - If nothing follows </think>, return the last sentence of the think block
+      so the user gets something rather than an empty bubble
+    """
     if not text:
         return text
-    # Strip reasoning/thinking blocks (DeepSeek-R1, Qwen3, etc.)
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-    # Remove complete <function>name{...}</function> blocks
+    # ── Handle <think> blocks (DeepSeek-R1, Qwen3, etc.) ──────────────────
+    if '<think>' in text:
+        # Extract everything after the last </think>
+        after = re.split(r'</think>', text, flags=re.DOTALL)[-1].strip()
+        if after:
+            text = after
+        else:
+            # Model returned only thinking with no final answer.
+            # Pull the last substantive sentence from inside the think block.
+            think_content = re.search(r'<think>(.*?)(?:</think>|$)', text,
+                                      flags=re.DOTALL)
+            if think_content:
+                lines = [l.strip() for l in think_content.group(1).splitlines()
+                         if l.strip() and not l.strip().startswith('<')]
+                text = lines[-1] if lines else ""
+            else:
+                text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    # ── Strip any remaining <function> / <function_calls> tags ────────────
     text = re.sub(r'<function>\w+\{[^}]*\}</function>', '', text, flags=re.DOTALL)
-    # Remove bare <function>name</function> (no args)
     text = re.sub(r'<function>\w+</function>', '', text)
-    # Remove <function_calls>...</function_calls> XML blocks (Claude-style)
     text = re.sub(r'<function_calls>.*?</function_calls>', '', text, flags=re.DOTALL)
     return text.strip()
 
@@ -1119,12 +1138,19 @@ def process_chat_agentic(user_message: str):
     text, tool_calls, asst_raw = adapter.chat(msg_payload, system, tools)
     # Fallback: some models (Groq/Llama) emit <function>name{...}</function>
     # as text instead of structured tool_calls. Detect and route them.
-    if not tool_calls and text and '<function>' in text:
-        print(f"  [{datetime.now().strftime('%H:%M:%S')}] [TextParser] Triggered for provider={config.get('llm',{}).get('provider','?')}")
-        # Strip reasoning blocks before parsing so <think> content doesn't
-        # confuse the tool call regex (DeepSeek-R1, Qwen3, etc.)
-        text_for_parse = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-        cleaned, tool_calls = _parse_text_tool_calls(text_for_parse)
+    if not tool_calls and text and ('<function>' in text or '<think>' in text):
+        # Extract post-think text first; function tags may live after </think>
+        if '<think>' in text:
+            after_think = re.split(r'</think>', text, flags=re.DOTALL)[-1].strip()
+            text_for_parse = after_think if after_think else text
+        else:
+            text_for_parse = text
+        if '<function>' not in text_for_parse:
+            # Pure reasoning response, no tool calls — strip and surface as reply
+            text = _strip_function_tags(text)
+        else:
+            print(f"  [{datetime.now().strftime('%H:%M:%S')}] [TextParser] Triggered for provider={config.get('llm',{}).get('active_profile','?')}")
+            cleaned, tool_calls = _parse_text_tool_calls(text_for_parse)
         if tool_calls:
             text    = cleaned or None
             # Build a synthetic asst_raw so chat_with_results works correctly
